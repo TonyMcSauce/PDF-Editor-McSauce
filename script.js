@@ -313,38 +313,40 @@ $('sigPickBtn' ).addEventListener('click', () => setPlaceMode('signature', 'sigP
    of e". Guard: wrap in try/catch with full stack logging.
 ─────────────────────────────────────────────────── */
 async function rebuild() {
-  if (!S.rawBytes) throw new Error('No PDF loaded');
+  if (!S.rawBytes) throw new Error('No PDF loaded.');
 
-  console.log('[rebuild] rawBytes length:', S.rawBytes.length);
-  console.log('[rebuild] pageOrder:', S.pageOrder);
-  console.log('[rebuild] pageRots:', S.pageRots);
+  const src  = await PDFDocument.load(S.rawBytes, { ignoreEncryption: true });
+  const dest = await PDFDocument.create();
 
-  // pdf-lib load — pass a COPY so it owns the buffer
-  const srcBytes = S.rawBytes.slice();
-  const src  = await PDFLib.PDFDocument.load(srcBytes, { ignoreEncryption: true });
-  console.log('[rebuild] src page count:', src.getPageCount());
-  const dest = await PDFLib.PDFDocument.create();
+  const total = src.getPageCount();
 
-  // Validate page order indices before passing to copyPages
-  const totalSrcPages = src.getPageCount();
-  const safeOrder = S.pageOrder.filter(i => i >= 0 && i < totalSrcPages);
-  if (safeOrder.length === 0) throw new Error('No valid pages to copy');
+  // HARD VALIDATION
+  const safeOrder = S.pageOrder.filter(i =>
+    Number.isInteger(i) &&
+    i >= 0 &&
+    i < total
+  );
 
-  const copied = await dest.copyPages(src, safeOrder);
-  copied.forEach((page, i) => {
+  if (safeOrder.length !== S.pageOrder.length) {
+    console.error("Invalid pageOrder detected:", S.pageOrder);
+    throw new Error("Internal page order corruption detected.");
+  }
+
+  const pages = await dest.copyPages(src, safeOrder);
+
+  pages.forEach((page, i) => {
     const origIdx = safeOrder[i];
     const extra   = S.pageRots[origIdx] || 0;
+
     if (extra !== 0) {
-      // getRotation() confirmed to return {type,angle} — safe
-      const curAngle = page.getRotation().angle;
-      page.setRotation(PDFLib.degrees((curAngle + extra) % 360));
+      const cur = getPageRotationAngle(page);
+      page.setRotation(degrees((cur + extra) % 360));
     }
+
     dest.addPage(page);
   });
 
-  const saved = await dest.save();
-  // dest.save() returns Uint8Array — confirm and return
-  return saved instanceof Uint8Array ? saved : new Uint8Array(saved);
+  return dest.save();
 }
 
 /**
