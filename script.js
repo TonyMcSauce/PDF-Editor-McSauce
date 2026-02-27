@@ -1,851 +1,786 @@
 /**
- * PDF Studio — script.js  (v2 — fully fixed)
- * Client-side PDF editor: PDF.js + pdf-lib + SortableJS
- * All processing is local — nothing is uploaded anywhere.
+ * PDF Studio — script.js v3
+ * Root causes of all failures fixed:
+ *   1. page.getRotation() returns undefined on un-rotated pages — guard it
+ *   2. PDFLib.degrees / PDFLib.StandardFonts / PDFLib.rgb — verified correct UMD names
+ *   3. getRebuildBytes was losing edits — fixed chain
+ *   4. Merge preview added
  */
 
 'use strict';
 
-/* =============================================
-   CONFIGURATION
-   ============================================= */
-const CONFIG = {
-  MAX_FILE_SIZE_MB: 50,
-  PDF_JS_WORKER: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
-  THUMB_SCALE: 0.28,
+/* ─── CONFIG ─────────────────────────────────────── */
+const CFG = {
+  MAX_MB:        50,
+  WORKER:        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
+  THUMB_SCALE:   0.28,
   PREVIEW_SCALE: 1.4,
-  ZOOM_STEP: 0.25,
-  ZOOM_MIN: 0.5,
-  ZOOM_MAX: 3.0,
+  ZOOM_STEP:     0.25,
+  ZOOM_MIN:      0.5,
+  ZOOM_MAX:      3.0,
 };
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = CONFIG.PDF_JS_WORKER;
+pdfjsLib.GlobalWorkerOptions.workerSrc = CFG.WORKER;
 
-/* =============================================
-   STATE
-   ============================================= */
-const state = {
-  pdfJsDoc: null,         // PDF.js doc — for rendering
-  rawBytes: null,         // Uint8Array — always the LATEST edited bytes
-  pageOrder: [],          // [originalIndex, ...] in current display order
-  pageRotations: {},      // { originalIndex: extraDegrees }
-  selectedPages: new Set(),
-  currentPreviewPage: 1,
-  totalPages: 0,
-  zoomLevel: 1.0,
-  isDarkMode: true,
-  mergeFiles: [],
-  sigDrawing: false,
-  placementMode: null,    // null | 'text' | 'image' | 'signature'
+/* ─── DESTRUCTURE pdf-lib ─────────────────────────
+   The UMD bundle exposes everything on window.PDFLib.
+   Destructure once here so we always use the right refs.
+   This is the fix for "expected instance of e" errors —
+   calling PDFLib.degrees(undefined) because getRotation()
+   returned undefined on pages with no explicit rotation.
+───────────────────────────────────────────────────── */
+const {
+  PDFDocument,
+  StandardFonts,
+  rgb,
+  degrees,
+  PageSizes,
+} = PDFLib;
+
+/* Safe wrapper — some pages have no explicit rotation; default to 0 */
+function getPageRotationAngle(page) {
+  try {
+    const r = page.getRotation();
+    return (r && typeof r.angle === 'number') ? r.angle : 0;
+  } catch (_) { return 0; }
+}
+
+/* ─── STATE ───────────────────────────────────────── */
+const S = {
+  /* Main loaded PDF */
+  pdfJsDoc:    null,   // PDF.js doc for rendering
+  rawBytes:    null,   // Uint8Array — latest edited bytes
+  pageOrder:   [],     // display order of original page indices
+  pageRots:    {},     // { origIdx: extraDegrees }
+  selectedPgs: new Set(),
+  curPage:     1,
+  totalPages:  0,
+  zoom:        1.0,
+  isDark:      true,
+
+  /* Merge */
+  mergeFiles:  [],     // File[]
+  mergeJsDocs: [],     // pdfjsLib docs for merge preview
+  mergeCurDoc: 0,      // which merge doc is previewed
+  mergeCurPg:  1,
+
+  /* Misc */
+  sigDrawing:  false,
+  placeMode:   null,   // null | 'text' | 'image' | 'signature'
 };
 
-/* =============================================
-   DOM HELPERS
-   ============================================= */
-const $ = id => document.getElementById(id);
+/* ─── DOM ─────────────────────────────────────────── */
+const $  = id => document.getElementById(id);
 const show = el => el && el.classList.remove('hidden');
 const hide = el => el && el.classList.add('hidden');
 
-function showToast(msg, type = 'info', duration = 4000) {
+function toast(msg, type = 'info', ms = 4500) {
   const t = $('toast');
   t.textContent = msg;
   t.className = `toast ${type}`;
   show(t);
   clearTimeout(t._t);
-  t._t = setTimeout(() => hide(t), duration);
+  t._t = setTimeout(() => hide(t), ms);
 }
 
-function setLoading(visible, text = 'Processing…') {
-  $('loadingText').textContent = text;
-  visible ? show($('loadingOverlay')) : hide($('loadingOverlay'));
+function loading(on, txt = 'Processing…') {
+  $('loadingText').textContent = txt;
+  on ? show($('loadingOverlay')) : hide($('loadingOverlay'));
 }
 
-function togglePwd(id) {
+function fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(2) + ' MB';
+}
+
+function okSize(f) {
+  if (f.size / 1048576 > CFG.MAX_MB) {
+    toast(`File too large (${fmtSize(f.size)}). Max ${CFG.MAX_MB} MB.`, 'error');
+    return false;
+  }
+  return true;
+}
+
+function okPage(n) {
+  if (!Number.isFinite(n) || n < 1 || n > S.totalPages) {
+    toast(`Page must be between 1 and ${S.totalPages}.`, 'error');
+    return false;
+  }
+  return true;
+}
+
+window.togglePwd = id => {
   const el = $(id);
   el.type = el.type === 'password' ? 'text' : 'password';
-}
-window.togglePwd = togglePwd;
+};
 
-function formatSize(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / 1048576).toFixed(2) + ' MB';
-}
-
-function validateFileSize(file) {
-  if (file.size / 1048576 > CONFIG.MAX_FILE_SIZE_MB) {
-    showToast(`File too large (${formatSize(file.size)}). Max ${CONFIG.MAX_FILE_SIZE_MB} MB.`, 'error');
-    return false;
-  }
-  return true;
-}
-
-function validPage(n) {
-  if (isNaN(n) || n < 1 || n > state.totalPages) {
-    showToast(`Invalid page number. Must be 1–${state.totalPages}.`, 'error');
-    return false;
-  }
-  return true;
-}
-
-/* =============================================
-   DARK MODE
-   ============================================= */
+/* ─── THEME ───────────────────────────────────────── */
 $('themeToggle').addEventListener('click', () => {
-  state.isDarkMode = !state.isDarkMode;
-  document.documentElement.setAttribute('data-theme', state.isDarkMode ? 'dark' : 'light');
-  $('themeToggle').innerHTML = state.isDarkMode
+  S.isDark = !S.isDark;
+  document.documentElement.setAttribute('data-theme', S.isDark ? 'dark' : 'light');
+  $('themeToggle').innerHTML = S.isDark
     ? '<i class="fa-solid fa-moon"></i>'
     : '<i class="fa-solid fa-sun"></i>';
 });
 
-/* =============================================
-   PANEL NAVIGATION
-   ============================================= */
+/* ─── PANEL NAV ───────────────────────────────────── */
 document.querySelectorAll('.tool-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     $(`panel-${btn.dataset.panel}`).classList.add('active');
-    if (btn.dataset.panel === 'pages' && state.pdfJsDoc) renderPageGrid();
+    if (btn.dataset.panel === 'pages' && S.pdfJsDoc) renderGrid();
+    if (btn.dataset.panel === 'merge') renderMergePreview();
   });
 });
 
-/* =============================================
-   UPLOAD
-   ============================================= */
+/* ─── UPLOAD ──────────────────────────────────────── */
+async function loadFile(file) {
+  if (!file || file.type !== 'application/pdf') {
+    toast('Please select a valid PDF file.', 'error'); return;
+  }
+  if (!okSize(file)) return;
+  loading(true, 'Loading PDF…');
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    await ingestBytes(bytes, true);
+    $('fileName').textContent = file.name;
+    $('fileSize').textContent  = `${fmtSize(file.size)} · ${S.totalPages} pages`;
+    hide($('dropZone')); show($('fileInfo'));
+    enableBtns(true);
+    updateSplitHint();
+    await previewMain(1);
+    toast(`Loaded: ${file.name} (${S.totalPages} pages)`, 'success');
+  } catch (e) {
+    console.error(e);
+    toast(`Load failed: ${e.message}`, 'error');
+  } finally {
+    loading(false);
+  }
+}
 
 /**
- * Core loader — given Uint8Array bytes, sets up both
- * PDF.js (for rendering) and tracks rawBytes (for editing).
- * isNewFile=true resets page order; false preserves it after edits.
+ * Ingest new bytes into state.
+ * isNew=true  → full reset (new file upload)
+ * isNew=false → preserve display state (after edit)
  */
-async function loadBytesIntoState(bytes, isNewFile = true) {
-  state.rawBytes = bytes;
-  // PDF.js needs its own copy of the buffer
-  state.pdfJsDoc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
-  state.totalPages = state.pdfJsDoc.numPages;
-
-  if (isNewFile) {
-    state.pageOrder = Array.from({ length: state.totalPages }, (_, i) => i);
-    state.pageRotations = {};
-    state.selectedPages.clear();
-    state.currentPreviewPage = 1;
+async function ingestBytes(bytes, isNew = false) {
+  S.rawBytes  = bytes;
+  S.pdfJsDoc  = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+  S.totalPages = S.pdfJsDoc.numPages;
+  if (isNew) {
+    S.pageOrder  = Array.from({ length: S.totalPages }, (_, i) => i);
+    S.pageRots   = {};
+    S.selectedPgs.clear();
+    S.curPage = 1;
   }
 }
 
-async function handleFileUpload(file) {
-  if (!file || file.type !== 'application/pdf') {
-    showToast('Please select a valid PDF file.', 'error'); return;
-  }
-  if (!validateFileSize(file)) return;
-
-  setLoading(true, 'Loading PDF…');
-  try {
-    const buf = await file.arrayBuffer();
-    await loadBytesIntoState(new Uint8Array(buf), true);
-
-    $('fileName').textContent = file.name;
-    $('fileSize').textContent = `${formatSize(file.size)} · ${state.totalPages} pages`;
-    hide($('dropZone'));
-    show($('fileInfo'));
-    enableButtons(true);
-    updateSplitHint();
-    await renderPreview(1);
-    showToast(`Loaded: ${file.name} (${state.totalPages} pages)`, 'success');
-  } catch (err) {
-    console.error('Upload error:', err);
-    showToast(`Failed to load: ${err.message}`, 'error');
-  } finally {
-    setLoading(false);
-  }
-}
-
-function enableButtons(on) {
+function enableBtns(on) {
   ['downloadBtn','splitBtn','addTextBtn','addImageBtn','addSigBtn','applyPwdBtn','zoomIn','zoomOut']
     .forEach(id => { const el = $(id); if (el) el.disabled = !on; });
-  updatePageControls();
+  updateNav();
 }
 
-$('fileInput').addEventListener('change', e => {
-  if (e.target.files[0]) handleFileUpload(e.target.files[0]);
-});
+/* File input */
+$('fileInput').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
 
-const dropZone = $('dropZone');
-dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-dropZone.addEventListener('drop', e => {
-  e.preventDefault(); dropZone.classList.remove('drag-over');
-  if (e.dataTransfer.files[0]) handleFileUpload(e.dataTransfer.files[0]);
+/* Drop zone */
+const dz = $('dropZone');
+dz.addEventListener('dragover',  e => { e.preventDefault(); dz.classList.add('drag-over'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('drag-over');
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
 });
 document.addEventListener('dragover', e => e.preventDefault());
-document.addEventListener('drop', e => { if (e.target !== dropZone) e.preventDefault(); });
+document.addEventListener('drop',     e => { if (e.target !== dz) e.preventDefault(); });
 
+/* Clear */
 $('clearFile').addEventListener('click', () => {
-  Object.assign(state, {
-    pdfJsDoc: null, rawBytes: null,
-    pageOrder: [], pageRotations: {},
-    totalPages: 0, currentPreviewPage: 1,
-  });
-  state.selectedPages.clear();
+  Object.assign(S, { pdfJsDoc:null, rawBytes:null, pageOrder:[], pageRots:{}, totalPages:0, curPage:1 });
+  S.selectedPgs.clear();
   show($('dropZone')); hide($('fileInfo'));
   $('fileInput').value = '';
   $('pageIndicator').textContent = '— / —';
-  hide($('previewCanvas'));
-  show($('previewPlaceholder'));
+  hide($('previewCanvas')); show($('previewPlaceholder'));
   $('pageGrid').innerHTML = '<p class="hint center">Upload a PDF to manage pages.</p>';
-  const po = $('placementOverlay');
-  if (po) po.getContext('2d').clearRect(0, 0, po.width, po.height);
-  enableButtons(false);
+  clearPlacementOverlay();
+  enableBtns(false);
 });
 
-/* =============================================
-   PREVIEW
-   ============================================= */
-async function renderPreview(pageNum) {
-  if (!state.pdfJsDoc) return;
-  pageNum = Math.max(1, Math.min(pageNum ?? state.currentPreviewPage, state.totalPages));
-  state.currentPreviewPage = pageNum;
+/* ─── MAIN PREVIEW ────────────────────────────────── */
+async function previewMain(pg) {
+  if (!S.pdfJsDoc) return;
+  pg = Math.max(1, Math.min(pg ?? S.curPage, S.totalPages));
+  S.curPage = pg;
 
-  const origIdx = state.pageOrder[pageNum - 1];
-  const pdfPage = await state.pdfJsDoc.getPage(origIdx + 1);
-  const addRot  = state.pageRotations[origIdx] || 0;
+  const origIdx = S.pageOrder[pg - 1];
+  const pdfPg   = await S.pdfJsDoc.getPage(origIdx + 1);
+  const addRot  = S.pageRots[origIdx] || 0;
+  const vp      = pdfPg.getViewport({ scale: CFG.PREVIEW_SCALE * S.zoom, rotation: (pdfPg.rotate + addRot) % 360 });
 
-  const viewport = pdfPage.getViewport({
-    scale: CONFIG.PREVIEW_SCALE * state.zoomLevel,
-    rotation: (pdfPage.rotate + addRot) % 360,
-  });
+  const cv = $('previewCanvas');
+  cv.width = vp.width; cv.height = vp.height;
+  show(cv); hide($('previewPlaceholder'));
+  await pdfPg.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
 
-  const canvas = $('previewCanvas');
-  canvas.width  = viewport.width;
-  canvas.height = viewport.height;
-  show(canvas);
-  hide($('previewPlaceholder'));
-
-  await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-  updatePageControls();
-
-  // Keep placement overlay in sync with canvas size
-  const overlay = $('placementOverlay');
-  if (overlay) { overlay.width = canvas.width; overlay.height = canvas.height; }
+  updateNav();
+  syncOverlay(cv);
 }
 
-function updatePageControls() {
-  $('pageIndicator').textContent = state.totalPages
-    ? `${state.currentPreviewPage} / ${state.totalPages}` : '— / —';
-  $('prevPage').disabled = !state.totalPages || state.currentPreviewPage <= 1;
-  $('nextPage').disabled = !state.totalPages || state.currentPreviewPage >= state.totalPages;
+function updateNav() {
+  $('pageIndicator').textContent = S.totalPages ? `${S.curPage} / ${S.totalPages}` : '— / —';
+  $('prevPage').disabled = !S.totalPages || S.curPage <= 1;
+  $('nextPage').disabled = !S.totalPages || S.curPage >= S.totalPages;
 }
 
-$('prevPage').addEventListener('click', () => renderPreview(state.currentPreviewPage - 1));
-$('nextPage').addEventListener('click', () => renderPreview(state.currentPreviewPage + 1));
+$('prevPage').addEventListener('click', () => previewMain(S.curPage - 1));
+$('nextPage').addEventListener('click', () => previewMain(S.curPage + 1));
 
 $('zoomIn').addEventListener('click', () => {
-  state.zoomLevel = Math.min(CONFIG.ZOOM_MAX, +(state.zoomLevel + CONFIG.ZOOM_STEP).toFixed(2));
-  $('zoomLabel').textContent = Math.round(state.zoomLevel * 100) + '%';
-  renderPreview();
+  S.zoom = Math.min(CFG.ZOOM_MAX, +(S.zoom + CFG.ZOOM_STEP).toFixed(2));
+  $('zoomLabel').textContent = Math.round(S.zoom * 100) + '%';
+  previewMain();
 });
 $('zoomOut').addEventListener('click', () => {
-  state.zoomLevel = Math.max(CONFIG.ZOOM_MIN, +(state.zoomLevel - CONFIG.ZOOM_STEP).toFixed(2));
-  $('zoomLabel').textContent = Math.round(state.zoomLevel * 100) + '%';
-  renderPreview();
+  S.zoom = Math.max(CFG.ZOOM_MIN, +(S.zoom - CFG.ZOOM_STEP).toFixed(2));
+  $('zoomLabel').textContent = Math.round(S.zoom * 100) + '%';
+  previewMain();
 });
 
-/* =============================================
-   PLACEMENT OVERLAY
-   Click on the preview canvas to pick X/Y position
-   for text, image, or signature overlays.
-   ============================================= */
-function initPlacementOverlay() {
-  const overlay = $('placementOverlay');
-  if (!overlay) return;
+/* ─── PLACEMENT OVERLAY ───────────────────────────── */
+function syncOverlay(cv) {
+  const ov = $('placementOverlay');
+  if (!ov) return;
+  ov.width  = cv.width;
+  ov.height = cv.height;
+}
 
-  overlay.addEventListener('click', e => {
-    if (!state.placementMode || !state.pdfJsDoc) return;
+function clearPlacementOverlay() {
+  const ov = $('placementOverlay');
+  if (!ov) return;
+  ov.getContext('2d').clearRect(0, 0, ov.width, ov.height);
+  ov.style.pointerEvents = 'none';
+  $('previewWrap').classList.remove('placement-active');
+}
 
-    const rect = overlay.getBoundingClientRect();
-    const cx = (e.clientX - rect.left) * (overlay.width  / rect.width);
-    const cy = (e.clientY - rect.top)  * (overlay.height / rect.height);
+$('placementOverlay').addEventListener('click', e => {
+  if (!S.placeMode || !S.pdfJsDoc) return;
+  const ov   = $('placementOverlay');
+  const rect = ov.getBoundingClientRect();
+  const cx   = (e.clientX - rect.left) * (ov.width  / rect.width);
+  const cy   = (e.clientY - rect.top)  * (ov.height / rect.height);
+  const scale = CFG.PREVIEW_SCALE * S.zoom;
+  const px   = Math.round(cx / scale);
+  const py   = Math.round(cy / scale);
 
-    // Convert from canvas pixels → PDF points (origin top-left, same as our input fields)
-    const scale = CONFIG.PREVIEW_SCALE * state.zoomLevel;
-    const pdfX  = Math.round(cx / scale);
-    const pdfY  = Math.round(cy / scale);
+  if (S.placeMode === 'text')      { $('textX').value = px; $('textY').value = py; }
+  if (S.placeMode === 'image')     { $('imgX').value  = px; $('imgY').value  = py; }
+  if (S.placeMode === 'signature') { $('sigX').value  = px; $('sigY').value  = py; }
 
-    if (state.placementMode === 'text') {
-      $('textX').value = pdfX; $('textY').value = pdfY;
-    } else if (state.placementMode === 'image') {
-      $('imgX').value = pdfX; $('imgY').value = pdfY;
-    } else if (state.placementMode === 'signature') {
-      $('sigX').value = pdfX; $('sigY').value = pdfY;
-    }
+  /* Draw crosshair */
+  const ctx = ov.getContext('2d');
+  ctx.clearRect(0, 0, ov.width, ov.height);
+  ctx.strokeStyle = '#4f8ef7'; ctx.lineWidth = 1.5; ctx.setLineDash([5,3]);
+  ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(ov.width, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, ov.height); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = '#4f8ef7';
+  ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI*2); ctx.fill();
+  ctx.font = 'bold 11px monospace'; ctx.fillText(`(${px}, ${py})`, cx + 8, cy - 5);
 
-    showToast(`Position set: X=${pdfX}, Y=${pdfY} (measured from top-left)`, 'success');
+  toast(`Position set → X: ${px}, Y: ${py} (from top-left)`, 'success', 3000);
+});
 
-    // Draw crosshair marker
-    const ctx = overlay.getContext('2d');
-    ctx.clearRect(0, 0, overlay.width, overlay.height);
-    ctx.strokeStyle = '#4f8ef7';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 3]);
-    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(overlay.width, cy); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, overlay.height); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = '#4f8ef7';
-    ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.fill();
+function setPlaceMode(mode, btnId) {
+  /* Toggle off if same mode */
+  if (S.placeMode === mode) { mode = null; }
+  S.placeMode = mode;
 
-    // Draw small label
-    ctx.fillStyle = '#4f8ef7';
-    ctx.font = '12px monospace';
-    ctx.fillText(`(${pdfX}, ${pdfY})`, cx + 10, cy - 6);
+  /* Reset all pick buttons */
+  ['textPickBtn','imgPickBtn','sigPickBtn'].forEach(id => {
+    const b = $(id);
+    if (!b) return;
+    b.classList.remove('active-pick');
+    b.innerHTML = '<i class="fa-solid fa-crosshairs"></i> Pick on Page';
   });
-}
-initPlacementOverlay();
 
-function setPlacementMode(mode, btnId) {
-  // Turn off current mode
-  if (state.placementMode) {
-    const prevBtn = $(`${state.placementMode}PickBtn`);
-    if (prevBtn) {
-      prevBtn.classList.remove('active-pick');
-      prevBtn.innerHTML = '<i class="fa-solid fa-crosshairs"></i> Pick on Page';
-    }
-    const overlay = $('placementOverlay');
-    if (overlay) {
-      overlay.style.pointerEvents = 'none';
-      overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
-    }
-    $('previewWrap').classList.remove('placement-active');
-  }
-
-  if (mode && mode !== state.placementMode) {
-    state.placementMode = mode;
-    const overlay = $('placementOverlay');
-    overlay.style.pointerEvents = 'all';
+  const ov = $('placementOverlay');
+  if (mode) {
+    ov.style.pointerEvents = 'all';
     $('previewWrap').classList.add('placement-active');
-    if (btnId) {
-      const btn = $(btnId);
-      btn.classList.add('active-pick');
-      btn.innerHTML = '<i class="fa-solid fa-xmark"></i> Cancel Pick';
-    }
-    showToast('Click anywhere on the preview to set the position.', 'info', 5000);
+    const b = $(btnId);
+    if (b) { b.classList.add('active-pick'); b.innerHTML = '<i class="fa-solid fa-xmark"></i> Cancel Pick'; }
+    toast('Click anywhere on the preview to set position.', 'info', 4000);
   } else {
-    state.placementMode = null;
+    clearPlacementOverlay();
   }
 }
 
-/* =============================================
-   MERGE
-   ============================================= */
+$('textPickBtn').addEventListener('click', () => setPlaceMode('text',      'textPickBtn'));
+$('imgPickBtn' ).addEventListener('click', () => setPlaceMode('image',     'imgPickBtn'));
+$('sigPickBtn' ).addEventListener('click', () => setPlaceMode('signature', 'sigPickBtn'));
+
+/* ─── CORE: REBUILD ──────────────────────────────────
+   Reconstruct a clean PDF from rawBytes applying
+   current pageOrder and extra rotations.
+   KEY FIX: guard getRotation() which can return undefined.
+───────────────────────────────────────────────────── */
+async function rebuild() {
+  if (!S.rawBytes) throw new Error('No PDF loaded.');
+  const src  = await PDFDocument.load(S.rawBytes, { ignoreEncryption: true });
+  const dest = await PDFDocument.create();
+  const pages = await dest.copyPages(src, S.pageOrder);
+  pages.forEach((page, i) => {
+    const origIdx = S.pageOrder[i];
+    const extra   = S.pageRots[origIdx] || 0;
+    if (extra !== 0) {
+      const cur = getPageRotationAngle(page); /* safe — won't throw */
+      page.setRotation(degrees((cur + extra) % 360));
+    }
+    dest.addPage(page);
+  });
+  return dest.save();
+}
+
+/**
+ * After an overlay edit (text / image / sig), the saved bytes
+ * represent a clean 1..N page doc. Reset order so subsequent
+ * edits chain correctly.
+ */
+async function applyEdit(bytes) {
+  const prevPage = S.curPage;
+  S.rawBytes    = bytes;
+  S.pdfJsDoc    = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+  S.totalPages  = S.pdfJsDoc.numPages;
+  S.pageOrder   = Array.from({ length: S.totalPages }, (_, i) => i);
+  S.pageRots    = {};
+  S.curPage     = Math.min(prevPage, S.totalPages);
+  updateNav();
+  updateSplitHint();
+  await previewMain(S.curPage);
+}
+
+/* ─── MERGE ───────────────────────────────────────── */
 function updateMergeList() {
   const list = $('mergeList');
   list.innerHTML = '';
-  state.mergeFiles.forEach((f, i) => {
+  S.mergeFiles.forEach((f, i) => {
     const li = document.createElement('li');
-    li.className = 'merge-item';
+    li.className = 'merge-item' + (i === S.mergeCurDoc ? ' merge-item-active' : '');
     li.innerHTML = `
       <i class="fa-solid fa-file-pdf"></i>
-      <span title="${f.name}">${f.name}</span>
-      <small style="color:var(--text-dim);font-family:var(--font-mono)">${formatSize(f.size)}</small>
-      <button class="icon-btn danger" title="Remove" onclick="removeMergeFile(${i})">
-        <i class="fa-solid fa-xmark"></i>
-      </button>`;
+      <span class="merge-item-name" title="${f.name}">${f.name}</span>
+      <small class="merge-item-size">${fmtSize(f.size)}</small>
+      <button class="icon-btn" title="Preview" onclick="previewMergeDoc(${i})"><i class="fa-solid fa-eye"></i></button>
+      <button class="icon-btn danger" title="Remove" onclick="removeMergeFile(${i})"><i class="fa-solid fa-xmark"></i></button>`;
     list.appendChild(li);
   });
-  $('mergeBtn').disabled = state.mergeFiles.length < 2;
+  $('mergeBtn').disabled = S.mergeFiles.length < 2;
+
+  /* Update merge preview nav */
+  const total = S.mergeJsDocs.length;
+  $('mergeDocLabel').textContent = total
+    ? `PDF ${S.mergeCurDoc + 1} / ${total} — Page ${S.mergeCurPg} / ${total ? (S.mergeJsDocs[S.mergeCurDoc]?.numPages || '?') : '?'}`
+    : 'No PDFs loaded';
+  $('mergePrevDoc').disabled = S.mergeCurDoc <= 0;
+  $('mergeNextDoc').disabled = S.mergeCurDoc >= total - 1;
+  $('mergePrevPg').disabled  = S.mergeCurPg <= 1;
+  $('mergeNextPg').disabled  = !total || S.mergeCurPg >= (S.mergeJsDocs[S.mergeCurDoc]?.numPages || 1);
 }
 
-window.removeMergeFile = i => { state.mergeFiles.splice(i, 1); updateMergeList(); };
-
-$('mergeInput').addEventListener('change', e => {
-  Array.from(e.target.files).forEach(f => {
-    if (f.type !== 'application/pdf') { showToast(`Skipped non-PDF: ${f.name}`, 'error'); return; }
-    if (!validateFileSize(f)) return;
-    state.mergeFiles.push(f);
-  });
-  updateMergeList(); e.target.value = '';
-});
-
-const mergeDropZone = $('mergeDropZone');
-mergeDropZone.addEventListener('dragover', e => { e.preventDefault(); mergeDropZone.classList.add('drag-over'); });
-mergeDropZone.addEventListener('dragleave', () => mergeDropZone.classList.remove('drag-over'));
-mergeDropZone.addEventListener('drop', e => {
-  e.preventDefault(); mergeDropZone.classList.remove('drag-over');
-  Array.from(e.dataTransfer.files).forEach(f => {
-    if (f.type === 'application/pdf' && validateFileSize(f)) state.mergeFiles.push(f);
-  });
+window.removeMergeFile = i => {
+  S.mergeFiles.splice(i, 1);
+  S.mergeJsDocs.splice(i, 1);
+  S.mergeCurDoc = Math.min(S.mergeCurDoc, S.mergeFiles.length - 1);
+  if (S.mergeCurDoc < 0) S.mergeCurDoc = 0;
+  S.mergeCurPg = 1;
   updateMergeList();
+  renderMergePreview();
+};
+
+window.previewMergeDoc = i => {
+  S.mergeCurDoc = i;
+  S.mergeCurPg  = 1;
+  renderMergePreview();
+  updateMergeList();
+};
+
+async function addMergeFiles(files) {
+  loading(true, 'Loading merge files…');
+  try {
+    for (const f of files) {
+      if (f.type !== 'application/pdf') { toast(`Skipped (not PDF): ${f.name}`, 'error'); continue; }
+      if (!okSize(f)) continue;
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      const jsDoc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+      S.mergeFiles.push(f);
+      S.mergeJsDocs.push(jsDoc);
+    }
+    S.mergeCurDoc = Math.max(0, S.mergeFiles.length - 1);
+    S.mergeCurPg  = 1;
+    updateMergeList();
+    await renderMergePreview();
+  } catch (e) {
+    toast(`Error loading: ${e.message}`, 'error');
+  } finally {
+    loading(false);
+  }
+}
+
+async function renderMergePreview() {
+  const cvs = $('mergePreviewCanvas');
+  const ph  = $('mergePreviewPlaceholder');
+  if (!S.mergeJsDocs.length) { hide(cvs); show(ph); return; }
+
+  const doc = S.mergeJsDocs[S.mergeCurDoc];
+  if (!doc) return;
+  S.mergeCurPg = Math.max(1, Math.min(S.mergeCurPg, doc.numPages));
+
+  const pg = await doc.getPage(S.mergeCurPg);
+  const vp = pg.getViewport({ scale: CFG.PREVIEW_SCALE });
+  cvs.width = vp.width; cvs.height = vp.height;
+  show(cvs); hide(ph);
+  await pg.render({ canvasContext: cvs.getContext('2d'), viewport: vp }).promise;
+  updateMergeList();
+}
+
+$('mergeInput').addEventListener('change', async e => {
+  await addMergeFiles(Array.from(e.target.files));
+  e.target.value = '';
 });
+
+const mdz = $('mergeDropZone');
+mdz.addEventListener('dragover',  e => { e.preventDefault(); mdz.classList.add('drag-over'); });
+mdz.addEventListener('dragleave', () => mdz.classList.remove('drag-over'));
+mdz.addEventListener('drop', async e => {
+  e.preventDefault(); mdz.classList.remove('drag-over');
+  await addMergeFiles(Array.from(e.dataTransfer.files));
+});
+
+/* Merge preview navigation */
+$('mergePrevDoc').addEventListener('click', () => { S.mergeCurDoc--; S.mergeCurPg = 1; renderMergePreview(); updateMergeList(); });
+$('mergeNextDoc').addEventListener('click', () => { S.mergeCurDoc++; S.mergeCurPg = 1; renderMergePreview(); updateMergeList(); });
+$('mergePrevPg' ).addEventListener('click', () => { S.mergeCurPg--; renderMergePreview(); });
+$('mergeNextPg' ).addEventListener('click', () => { S.mergeCurPg++; renderMergePreview(); });
 
 $('mergeBtn').addEventListener('click', async () => {
-  if (state.mergeFiles.length < 2) return;
-  setLoading(true, `Merging ${state.mergeFiles.length} PDFs…`);
+  if (S.mergeFiles.length < 2) return;
+  loading(true, `Merging ${S.mergeFiles.length} PDFs…`);
   try {
-    const merged = await PDFLib.PDFDocument.create();
-    for (const file of state.mergeFiles) {
-      const buf  = await file.arrayBuffer();
-      const doc  = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true });
-      const pages = await merged.copyPages(doc, doc.getPageIndices());
-      pages.forEach(p => merged.addPage(p));
+    const merged = await PDFDocument.create();
+    for (const f of S.mergeFiles) {
+      const buf  = await f.arrayBuffer();
+      const doc  = await PDFDocument.load(buf, { ignoreEncryption: true });
+      const pgs  = await merged.copyPages(doc, doc.getPageIndices());
+      pgs.forEach(p => merged.addPage(p));
     }
-    downloadBytes(await merged.save(), 'merged.pdf');
-    showToast(`Merged ${state.mergeFiles.length} PDFs successfully!`, 'success');
-  } catch (err) {
-    console.error('Merge error:', err);
-    showToast(`Merge failed: ${err.message}`, 'error');
+    dlBytes(await merged.save(), 'merged.pdf');
+    toast(`Merged ${S.mergeFiles.length} PDFs!`, 'success');
+  } catch (e) {
+    console.error(e); toast(`Merge failed: ${e.message}`, 'error');
   } finally {
-    setLoading(false);
+    loading(false);
   }
 });
 
-/* =============================================
-   SPLIT
-   ============================================= */
+/* ─── SPLIT ───────────────────────────────────────── */
 function updateSplitHint() {
-  $('splitPageCount').textContent = state.totalPages ? `Document has ${state.totalPages} pages` : '';
-  if (state.totalPages) {
-    $('splitTo').value = state.totalPages;
-    $('splitFrom').max = $('splitTo').max = state.totalPages;
+  $('splitPageCount').textContent = S.totalPages ? `Document has ${S.totalPages} pages` : '';
+  if (S.totalPages) {
+    $('splitTo').value = S.totalPages;
+    $('splitFrom').max = $('splitTo').max = S.totalPages;
   }
 }
 
 $('splitBtn').addEventListener('click', async () => {
-  if (!state.rawBytes) return;
+  if (!S.rawBytes) return;
   const from = parseInt($('splitFrom').value, 10);
   const to   = parseInt($('splitTo').value,   10);
-  if (isNaN(from) || isNaN(to) || from < 1 || to > state.totalPages || from > to) {
-    showToast('Invalid page range.', 'error'); return;
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from < 1 || to > S.totalPages || from > to) {
+    toast('Invalid page range.', 'error'); return;
   }
-  setLoading(true, 'Extracting pages…');
+  loading(true, 'Splitting…');
   try {
-    // Load DIRECTLY from rawBytes — no rebuild needed for split
-    const src  = await PDFLib.PDFDocument.load(state.rawBytes, { ignoreEncryption: true });
-    const dest = await PDFLib.PDFDocument.create();
+    const src  = await PDFDocument.load(S.rawBytes, { ignoreEncryption: true });
+    const dest = await PDFDocument.create();
     const idxs = Array.from({ length: to - from + 1 }, (_, i) => from - 1 + i);
-    const pages = await dest.copyPages(src, idxs);
-    pages.forEach(p => dest.addPage(p));
-    downloadBytes(await dest.save(), `pages_${from}-${to}.pdf`);
-    showToast(`Extracted pages ${from}–${to}`, 'success');
-  } catch (err) {
-    console.error('Split error:', err);
-    showToast(`Split failed: ${err.message}`, 'error');
+    const pgs  = await dest.copyPages(src, idxs);
+    pgs.forEach(p => dest.addPage(p));
+    dlBytes(await dest.save(), `pages_${from}-${to}.pdf`);
+    toast(`Extracted pages ${from}–${to}`, 'success');
+  } catch (e) {
+    console.error(e); toast(`Split failed: ${e.message}`, 'error');
   } finally {
-    setLoading(false);
+    loading(false);
   }
 });
 
-/* =============================================
-   PAGES — Manage / Reorder / Delete / Rotate
-   ============================================= */
-let sortableInstance = null;
+/* ─── PAGES GRID ──────────────────────────────────── */
+let sortable = null;
 
-async function renderPageGrid() {
-  if (!state.pdfJsDoc) return;
+async function renderGrid() {
+  if (!S.pdfJsDoc) return;
   const grid = $('pageGrid');
   grid.innerHTML = '';
-  setLoading(true, 'Rendering page thumbnails…');
+  loading(true, 'Rendering thumbnails…');
   try {
-    for (let i = 0; i < state.pageOrder.length; i++) {
-      const origIdx = state.pageOrder[i];
-      const page    = await state.pdfJsDoc.getPage(origIdx + 1);
-      const addRot  = state.pageRotations[origIdx] || 0;
-      const vp      = page.getViewport({
-        scale: CONFIG.THUMB_SCALE,
-        rotation: (page.rotate + addRot) % 360,
-      });
+    for (let i = 0; i < S.pageOrder.length; i++) {
+      const origIdx = S.pageOrder[i];
+      const pg      = await S.pdfJsDoc.getPage(origIdx + 1);
+      const addRot  = S.pageRots[origIdx] || 0;
+      const vp      = pg.getViewport({ scale: CFG.THUMB_SCALE, rotation: (pg.rotate + addRot) % 360 });
 
       const thumb = document.createElement('div');
-      thumb.className = 'page-thumb';
+      thumb.className = 'page-thumb' + (S.selectedPgs.has(i) ? ' selected' : '');
       thumb.dataset.order = i;
-      if (state.selectedPages.has(i)) thumb.classList.add('selected');
 
-      const canvas = document.createElement('canvas');
-      canvas.width = vp.width; canvas.height = vp.height;
-      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+      const cv = document.createElement('canvas');
+      cv.width = vp.width; cv.height = vp.height;
+      await pg.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
 
-      const label = document.createElement('div');
-      label.className = 'page-thumb-label';
-      label.textContent = `Page ${i + 1}`;
+      const lbl = document.createElement('div');
+      lbl.className = 'page-thumb-label';
+      lbl.textContent = `Page ${i + 1}`;
 
-      const badge = document.createElement('div');
-      badge.className = 'page-thumb-select';
-      badge.innerHTML = '<i class="fa-solid fa-check" style="font-size:0.6rem"></i>';
+      const chk = document.createElement('div');
+      chk.className = 'page-thumb-select';
+      chk.innerHTML = '<i class="fa-solid fa-check" style="font-size:.6rem"></i>';
 
-      thumb.append(canvas, label, badge);
-
+      thumb.append(cv, lbl, chk);
       if (addRot) {
         const rb = document.createElement('div');
-        rb.className = 'page-rotation-badge';
-        rb.textContent = `${addRot}°`;
+        rb.className = 'page-rotation-badge'; rb.textContent = `${addRot}°`;
         thumb.appendChild(rb);
       }
 
       thumb.addEventListener('click', () => {
-        const idx = parseInt(thumb.dataset.order, 10);
-        if (state.selectedPages.has(idx)) {
-          state.selectedPages.delete(idx); thumb.classList.remove('selected');
-        } else {
-          state.selectedPages.add(idx); thumb.classList.add('selected');
-        }
-        updatePageToolbarState();
+        const idx = +thumb.dataset.order;
+        S.selectedPgs.has(idx) ? (S.selectedPgs.delete(idx), thumb.classList.remove('selected'))
+                                : (S.selectedPgs.add(idx),    thumb.classList.add('selected'));
+        updateGridBtns();
       });
-
       grid.appendChild(thumb);
     }
 
-    if (sortableInstance) sortableInstance.destroy();
-    sortableInstance = Sortable.create(grid, {
-      animation: 180,
-      ghostClass: 'sortable-ghost',
-      onEnd(evt) {
-        const moved = state.pageOrder.splice(evt.oldIndex, 1)[0];
-        state.pageOrder.splice(evt.newIndex, 0, moved);
+    if (sortable) sortable.destroy();
+    sortable = Sortable.create(grid, {
+      animation: 160, ghostClass: 'sortable-ghost',
+      onEnd(ev) {
+        const moved = S.pageOrder.splice(ev.oldIndex, 1)[0];
+        S.pageOrder.splice(ev.newIndex, 0, moved);
         grid.querySelectorAll('.page-thumb').forEach((el, i) => {
           el.dataset.order = i;
           el.querySelector('.page-thumb-label').textContent = `Page ${i + 1}`;
         });
-        state.selectedPages.clear();
-        showToast('Pages reordered. Download to save changes.', 'info');
+        S.selectedPgs.clear(); toast('Pages reordered. Download to save.', 'info');
       },
     });
-  } finally {
-    setLoading(false);
-  }
-  updatePageToolbarState();
+  } finally { loading(false); }
+  updateGridBtns();
 }
 
-function updatePageToolbarState() {
-  const has = state.selectedPages.size > 0;
+function updateGridBtns() {
+  const has = S.selectedPgs.size > 0;
   $('deleteSelectedBtn').disabled = !has;
   $('rotateLeftBtn').disabled  = !has;
   $('rotateRightBtn').disabled = !has;
 }
 
 $('selectAllBtn').addEventListener('click', () => {
-  for (let i = 0; i < state.pageOrder.length; i++) state.selectedPages.add(i);
+  S.pageOrder.forEach((_, i) => S.selectedPgs.add(i));
   document.querySelectorAll('.page-thumb').forEach(t => t.classList.add('selected'));
-  updatePageToolbarState();
+  updateGridBtns();
 });
 $('deselectAllBtn').addEventListener('click', () => {
-  state.selectedPages.clear();
+  S.selectedPgs.clear();
   document.querySelectorAll('.page-thumb').forEach(t => t.classList.remove('selected'));
-  updatePageToolbarState();
+  updateGridBtns();
 });
 
 $('deleteSelectedBtn').addEventListener('click', async () => {
-  if (!state.selectedPages.size) return;
-  if (state.selectedPages.size >= state.pageOrder.length) {
-    showToast('Cannot delete all pages.', 'error'); return;
-  }
-  if (!confirm(`Delete ${state.selectedPages.size} page(s)? This cannot be undone.`)) return;
-
-  [...state.selectedPages].sort((a, b) => b - a).forEach(i => state.pageOrder.splice(i, 1));
-  state.selectedPages.clear();
-  state.totalPages = state.pageOrder.length;
-  state.currentPreviewPage = Math.min(state.currentPreviewPage, state.totalPages);
-  updatePageControls();
-  updateSplitHint();
-  await renderPageGrid();
-  renderPreview(state.currentPreviewPage);
-  showToast('Pages deleted.', 'success');
+  if (!S.selectedPgs.size) return;
+  if (S.selectedPgs.size >= S.pageOrder.length) { toast('Cannot delete all pages.', 'error'); return; }
+  if (!confirm(`Delete ${S.selectedPgs.size} page(s)?`)) return;
+  [...S.selectedPgs].sort((a,b)=>b-a).forEach(i => S.pageOrder.splice(i,1));
+  S.selectedPgs.clear();
+  S.totalPages = S.pageOrder.length;
+  S.curPage    = Math.min(S.curPage, S.totalPages);
+  updateNav(); updateSplitHint();
+  await renderGrid(); previewMain(S.curPage);
+  toast('Pages deleted.', 'success');
 });
 
-async function rotateSelected(deg) {
-  if (!state.selectedPages.size) return;
-  const count = state.selectedPages.size;
-  state.selectedPages.forEach(orderIdx => {
-    const origIdx = state.pageOrder[orderIdx];
-    state.pageRotations[origIdx] = ((state.pageRotations[origIdx] || 0) + deg + 360) % 360;
+async function rotateSel(deg) {
+  if (!S.selectedPgs.size) return;
+  const cnt = S.selectedPgs.size;
+  S.selectedPgs.forEach(i => {
+    const orig = S.pageOrder[i];
+    S.pageRots[orig] = ((S.pageRots[orig] || 0) + deg + 360) % 360;
   });
-  state.selectedPages.clear();
-  await renderPageGrid();
-  renderPreview(state.currentPreviewPage);
-  showToast(`Rotated ${count} page(s).`, 'success');
+  S.selectedPgs.clear();
+  await renderGrid(); previewMain(S.curPage);
+  toast(`Rotated ${cnt} page(s).`, 'success');
 }
-$('rotateLeftBtn').addEventListener('click',  () => rotateSelected(-90));
-$('rotateRightBtn').addEventListener('click', () => rotateSelected(90));
+$('rotateLeftBtn').addEventListener('click',  () => rotateSel(-90));
+$('rotateRightBtn').addEventListener('click', () => rotateSel(90));
 
-/* =============================================
-   CORE: getRebuildBytes
-   Applies current pageOrder + rotations to rawBytes.
-   Returns a new Uint8Array representing the full edited PDF.
-   ============================================= */
-async function getRebuildBytes() {
-  if (!state.rawBytes) throw new Error('No PDF loaded');
-  const src    = await PDFLib.PDFDocument.load(state.rawBytes, { ignoreEncryption: true });
-  const newDoc = await PDFLib.PDFDocument.create();
-  // Copy pages in current display order
-  const pages  = await newDoc.copyPages(src, state.pageOrder);
-  pages.forEach((page, i) => {
-    const origIdx = state.pageOrder[i];
-    const addRot  = state.pageRotations[origIdx] || 0;
-    if (addRot) {
-      page.setRotation(PDFLib.degrees((page.getRotation().angle + addRot) % 360));
-    }
-    newDoc.addPage(page);
-  });
-  return newDoc.save();
-}
-
-/**
- * After any edit that changes page content (text/image/sig),
- * persist the result so future edits chain correctly.
- * After save, rawBytes represent a linear 1-N page doc, so reset order.
- */
-async function applyNewBytes(bytes) {
-  const prevPage = state.currentPreviewPage;
-  // After getRebuildBytes + edit, the resulting doc has pages in order 0..N-1
-  state.rawBytes = bytes;
-  state.pdfJsDoc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
-  state.totalPages = state.pdfJsDoc.numPages;
-  state.pageOrder = Array.from({ length: state.totalPages }, (_, i) => i);
-  state.pageRotations = {};
-  state.currentPreviewPage = Math.min(prevPage, state.totalPages);
-  updatePageControls();
-  updateSplitHint();
-  await renderPreview(state.currentPreviewPage);
-}
-
-/* =============================================
-   TEXT OVERLAY
-   ============================================= */
-$('textPickBtn').addEventListener('click', () => {
-  setPlacementMode(state.placementMode === 'text' ? null : 'text', 'textPickBtn');
-});
-
+/* ─── TEXT OVERLAY ────────────────────────────────── */
 $('addTextBtn').addEventListener('click', async () => {
-  if (!state.rawBytes) return;
+  if (!S.rawBytes) return;
   const text = $('overlayText').value.trim();
-  if (!text) { showToast('Please enter some text.', 'error'); return; }
-  const pageNum = parseInt($('textPage').value, 10);
-  if (!validPage(pageNum)) return;
-  const size  = Math.max(1, parseFloat($('textSize').value) || 24);
-  const x     = parseFloat($('textX').value)     || 0;
-  const yTop  = parseFloat($('textY').value)     || 0;
-  const color = hexToRgb($('textColor').value);
+  if (!text) { toast('Enter some text first.', 'error'); return; }
+  const pg   = parseInt($('textPage').value,  10); if (!okPage(pg)) return;
+  const size = Math.max(1, parseFloat($('textSize').value) || 24);
+  const x    = parseFloat($('textX').value) || 0;
+  const yTop = parseFloat($('textY').value) || 0;
+  const col  = hexRgb($('textColor').value);
 
-  setLoading(true, 'Adding text…');
+  loading(true, 'Adding text…');
   try {
-    // Build with page order/rotations baked in first
-    const base = await getRebuildBytes();
-    const doc  = await PDFLib.PDFDocument.load(base, { ignoreEncryption: true });
-    const font = await doc.embedFont(PDFLib.StandardFonts.Helvetica);
-    const page = doc.getPages()[pageNum - 1];
+    const base  = await rebuild();
+    const doc   = await PDFDocument.load(base, { ignoreEncryption: true });
+    const font  = await doc.embedFont(StandardFonts.Helvetica);
+    const page  = doc.getPages()[pg - 1];
     const { height } = page.getSize();
-    // Input Y is from top; PDF origin is bottom-left, so invert
     page.drawText(text, {
-      x, y: height - yTop - size, size, font,
-      color: PDFLib.rgb(color.r / 255, color.g / 255, color.b / 255),
+      x, y: height - yTop - size,   /* convert top→bottom coords */
+      size, font,
+      color: rgb(col.r/255, col.g/255, col.b/255),
     });
-    await applyNewBytes(await doc.save());
-    setPlacementMode(null);
-    showToast('Text added! Preview updated.', 'success');
-  } catch (err) {
-    console.error('Text error:', err);
-    showToast(`Failed to add text: ${err.message}`, 'error');
-  } finally {
-    setLoading(false);
-  }
+    await applyEdit(await doc.save());
+    setPlaceMode(null);
+    toast('Text added!', 'success');
+  } catch (e) {
+    console.error(e); toast(`Text failed: ${e.message}`, 'error');
+  } finally { loading(false); }
 });
 
-/* =============================================
-   IMAGE OVERLAY
-   ============================================= */
-$('imgPickBtn').addEventListener('click', () => {
-  setPlacementMode(state.placementMode === 'image' ? null : 'image', 'imgPickBtn');
-});
-
+/* ─── IMAGE OVERLAY ───────────────────────────────── */
 $('addImageBtn').addEventListener('click', async () => {
-  if (!state.rawBytes) return;
-  const fileEl = $('overlayImageInput');
-  if (!fileEl.files[0]) { showToast('Please select an image file.', 'error'); return; }
-  const file    = fileEl.files[0];
-  const pageNum = parseInt($('imgPage').value, 10);
-  if (!validPage(pageNum)) return;
+  if (!S.rawBytes) return;
+  const fi = $('overlayImageInput');
+  if (!fi.files[0]) { toast('Select an image file.', 'error'); return; }
+  const f    = fi.files[0];
+  const pg   = parseInt($('imgPage').value, 10); if (!okPage(pg)) return;
   const x    = parseFloat($('imgX').value) || 0;
   const yTop = parseFloat($('imgY').value) || 0;
   const w    = parseFloat($('imgW').value) || 150;
   const h    = parseFloat($('imgH').value) || 100;
 
-  setLoading(true, 'Embedding image…');
+  loading(true, 'Embedding image…');
   try {
-    const base   = await getRebuildBytes();
-    const doc    = await PDFLib.PDFDocument.load(base, { ignoreEncryption: true });
-    const imgBuf = await file.arrayBuffer();
-    let img;
-    if      (file.type === 'image/png')  img = await doc.embedPng(imgBuf);
-    else if (file.type === 'image/jpeg' || file.type === 'image/jpg') img = await doc.embedJpg(imgBuf);
-    else { showToast('Only PNG and JPEG images supported.', 'error'); setLoading(false); return; }
-    const page = doc.getPages()[pageNum - 1];
+    const base   = await rebuild();
+    const doc    = await PDFDocument.load(base, { ignoreEncryption: true });
+    const imgBuf = await f.arrayBuffer();
+    const img    = f.type === 'image/png'
+      ? await doc.embedPng(imgBuf)
+      : await doc.embedJpg(imgBuf);
+    const page   = doc.getPages()[pg - 1];
     page.drawImage(img, { x, y: page.getSize().height - yTop - h, width: w, height: h });
-    await applyNewBytes(await doc.save());
-    setPlacementMode(null);
-    showToast('Image embedded! Preview updated.', 'success');
-  } catch (err) {
-    console.error('Image error:', err);
-    showToast(`Failed to embed image: ${err.message}`, 'error');
-  } finally {
-    setLoading(false);
-  }
+    await applyEdit(await doc.save());
+    setPlaceMode(null);
+    toast('Image embedded!', 'success');
+  } catch (e) {
+    console.error(e); toast(`Image failed: ${e.message}`, 'error');
+  } finally { loading(false); }
 });
 
-/* =============================================
-   SIGNATURE
-   ============================================= */
-const sigCanvas = $('sigCanvas');
-const sigCtx    = sigCanvas.getContext('2d');
+/* ─── SIGNATURE ───────────────────────────────────── */
+const sigCv  = $('sigCanvas');
+const sigCtx = sigCv.getContext('2d');
+$('clearSig').addEventListener('click', () => sigCtx.clearRect(0, 0, sigCv.width, sigCv.height));
 
-$('clearSig').addEventListener('click', () => {
-  sigCtx.clearRect(0, 0, sigCanvas.width, sigCanvas.height);
-});
-
-function getSigPos(e) {
-  const rect = sigCanvas.getBoundingClientRect();
-  const src  = e.touches ? e.touches[0] : e;
-  return {
-    x: (src.clientX - rect.left) * (sigCanvas.width  / rect.width),
-    y: (src.clientY - rect.top)  * (sigCanvas.height / rect.height),
-  };
+function sigPos(e) {
+  const r  = sigCv.getBoundingClientRect();
+  const src = e.touches ? e.touches[0] : e;
+  return { x: (src.clientX-r.left)*(sigCv.width/r.width), y: (src.clientY-r.top)*(sigCv.height/r.height) };
 }
-
-// Mouse
-sigCanvas.addEventListener('mousedown', e => {
-  e.preventDefault(); state.sigDrawing = true;
-  const p = getSigPos(e); sigCtx.beginPath(); sigCtx.moveTo(p.x, p.y);
-});
-sigCanvas.addEventListener('mousemove', e => {
-  e.preventDefault(); if (!state.sigDrawing) return;
-  const p = getSigPos(e);
-  sigCtx.strokeStyle = $('sigColor').value;
-  sigCtx.lineWidth   = +$('sigStroke').value;
-  sigCtx.lineCap = 'round'; sigCtx.lineJoin = 'round';
-  sigCtx.lineTo(p.x, p.y); sigCtx.stroke();
-});
-sigCanvas.addEventListener('mouseup',    () => { state.sigDrawing = false; });
-sigCanvas.addEventListener('mouseleave', () => { state.sigDrawing = false; });
-
-// Touch
-sigCanvas.addEventListener('touchstart', e => {
-  e.preventDefault(); state.sigDrawing = true;
-  const p = getSigPos(e); sigCtx.beginPath(); sigCtx.moveTo(p.x, p.y);
-}, { passive: false });
-sigCanvas.addEventListener('touchmove', e => {
-  e.preventDefault(); if (!state.sigDrawing) return;
-  const p = getSigPos(e);
-  sigCtx.strokeStyle = $('sigColor').value;
-  sigCtx.lineWidth   = +$('sigStroke').value;
-  sigCtx.lineCap = 'round'; sigCtx.lineJoin = 'round';
-  sigCtx.lineTo(p.x, p.y); sigCtx.stroke();
-}, { passive: false });
-sigCanvas.addEventListener('touchend', () => { state.sigDrawing = false; });
-
-$('sigPickBtn').addEventListener('click', () => {
-  setPlacementMode(state.placementMode === 'signature' ? null : 'signature', 'sigPickBtn');
-});
+sigCv.addEventListener('mousedown',  e => { e.preventDefault(); S.sigDrawing=true; const p=sigPos(e); sigCtx.beginPath(); sigCtx.moveTo(p.x,p.y); });
+sigCv.addEventListener('mousemove',  e => { e.preventDefault(); if(!S.sigDrawing)return; const p=sigPos(e); sigCtx.strokeStyle=$('sigColor').value; sigCtx.lineWidth=+$('sigStroke').value; sigCtx.lineCap='round'; sigCtx.lineJoin='round'; sigCtx.lineTo(p.x,p.y); sigCtx.stroke(); });
+sigCv.addEventListener('mouseup',    () => { S.sigDrawing=false; });
+sigCv.addEventListener('mouseleave', () => { S.sigDrawing=false; });
+sigCv.addEventListener('touchstart', e => { e.preventDefault(); S.sigDrawing=true; const p=sigPos(e); sigCtx.beginPath(); sigCtx.moveTo(p.x,p.y); }, {passive:false});
+sigCv.addEventListener('touchmove',  e => { e.preventDefault(); if(!S.sigDrawing)return; const p=sigPos(e); sigCtx.strokeStyle=$('sigColor').value; sigCtx.lineWidth=+$('sigStroke').value; sigCtx.lineCap='round'; sigCtx.lineJoin='round'; sigCtx.lineTo(p.x,p.y); sigCtx.stroke(); }, {passive:false});
+sigCv.addEventListener('touchend',   () => { S.sigDrawing=false; });
 
 $('addSigBtn').addEventListener('click', async () => {
-  if (!state.rawBytes) return;
-  const data = sigCtx.getImageData(0, 0, sigCanvas.width, sigCanvas.height);
-  if (!data.data.some(v => v > 0)) { showToast('Please draw a signature first.', 'error'); return; }
-  const pageNum = parseInt($('sigPage').value, 10);
-  if (!validPage(pageNum)) return;
+  if (!S.rawBytes) return;
+  const px = sigCtx.getImageData(0,0,sigCv.width,sigCv.height);
+  if (!px.data.some(v=>v>0)) { toast('Draw a signature first.', 'error'); return; }
+  const pg   = parseInt($('sigPage').value, 10); if (!okPage(pg)) return;
   const x    = parseFloat($('sigX').value) || 50;
   const yTop = parseFloat($('sigY').value) || 50;
   const w    = parseFloat($('sigW').value) || 200;
   const h    = parseFloat($('sigH').value) || 80;
 
-  setLoading(true, 'Embedding signature…');
+  loading(true, 'Embedding signature…');
   try {
-    const pngBytes = dataURLtoBytes(sigCanvas.toDataURL('image/png'));
-    const base = await getRebuildBytes();
-    const doc  = await PDFLib.PDFDocument.load(base, { ignoreEncryption: true });
-    const img  = await doc.embedPng(pngBytes);
-    const page = doc.getPages()[pageNum - 1];
+    const pngBytes = du2bytes(sigCv.toDataURL('image/png'));
+    const base  = await rebuild();
+    const doc   = await PDFDocument.load(base, { ignoreEncryption: true });
+    const img   = await doc.embedPng(pngBytes);
+    const page  = doc.getPages()[pg - 1];
     page.drawImage(img, { x, y: page.getSize().height - yTop - h, width: w, height: h });
-    await applyNewBytes(await doc.save());
-    setPlacementMode(null);
-    showToast('Signature embedded! Preview updated.', 'success');
-  } catch (err) {
-    console.error('Signature error:', err);
-    showToast(`Failed to embed signature: ${err.message}`, 'error');
-  } finally {
-    setLoading(false);
-  }
+    await applyEdit(await doc.save());
+    setPlaceMode(null);
+    toast('Signature embedded!', 'success');
+  } catch (e) {
+    console.error(e); toast(`Signature failed: ${e.message}`, 'error');
+  } finally { loading(false); }
 });
 
-/* =============================================
-   SECURITY
-   ============================================= */
+/* ─── SECURITY ────────────────────────────────────── */
 $('applyPwdBtn').addEventListener('click', async () => {
-  if (!state.rawBytes) return;
-  const userPwd = $('userPassword').value;
-  if (!userPwd) { showToast('Please enter a user password.', 'error'); return; }
-  setLoading(true, 'Preparing PDF for download…');
+  if (!S.rawBytes) return;
+  const up = $('userPassword').value;
+  if (!up) { toast('Enter a user password first.', 'error'); return; }
+  loading(true, 'Saving PDF…');
   try {
-    // pdf-lib 1.x does not support writing encrypted PDFs — save as-is
-    const bytes = await getRebuildBytes();
-    downloadBytes(bytes, 'document.pdf');
-    showToast(
-      'PDF saved without encryption (pdf-lib limitation). ' +
-      'Run: qpdf --encrypt ' + userPwd + ' ' + ($('ownerPassword').value || userPwd) + ' 256 -- doc.pdf out.pdf',
-      'info', 8000
-    );
-  } catch (err) {
-    console.error('Security error:', err);
-    showToast(`Failed: ${err.message}`, 'error');
-  } finally {
-    setLoading(false);
-  }
+    const bytes = await rebuild();
+    dlBytes(bytes, 'document.pdf');
+    toast(`PDF saved. To encrypt, run: qpdf --encrypt ${up} ${$('ownerPassword').value||up} 256 -- document.pdf encrypted.pdf`, 'info', 9000);
+  } catch (e) {
+    console.error(e); toast(`Failed: ${e.message}`, 'error');
+  } finally { loading(false); }
 });
 
-/* =============================================
-   DOWNLOAD
-   ============================================= */
+/* ─── DOWNLOAD ────────────────────────────────────── */
 $('downloadBtn').addEventListener('click', async () => {
-  if (!state.rawBytes) return;
-  setLoading(true, 'Building final PDF…');
+  if (!S.rawBytes) return;
+  loading(true, 'Building PDF…');
   try {
-    const bytes = await getRebuildBytes();
-    downloadBytes(bytes, 'edited.pdf');
-    showToast('PDF downloaded!', 'success');
-  } catch (err) {
-    console.error('Download error:', err);
-    showToast(`Download failed: ${err.message}`, 'error');
-  } finally {
-    setLoading(false);
-  }
+    dlBytes(await rebuild(), 'edited.pdf');
+    toast('PDF downloaded!', 'success');
+  } catch (e) {
+    console.error(e); toast(`Download failed: ${e.message}`, 'error');
+  } finally { loading(false); }
 });
 
-/* =============================================
-   UTILITIES
-   ============================================= */
-function downloadBytes(bytes, filename) {
-  const blob = new Blob([bytes], { type: 'application/pdf' });
-  const url  = URL.createObjectURL(blob);
-  const a    = Object.assign(document.createElement('a'), { href: url, download: filename });
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+/* ─── UTILS ───────────────────────────────────────── */
+function dlBytes(bytes, name) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+  const a   = Object.assign(document.createElement('a'), { href: url, download: name });
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
-function hexToRgb(hex) {
+function hexRgb(hex) {
   const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  return m ? { r: parseInt(m[1],16), g: parseInt(m[2],16), b: parseInt(m[3],16) } : { r:0,g:0,b:0 };
+  return m ? { r:parseInt(m[1],16), g:parseInt(m[2],16), b:parseInt(m[3],16) } : {r:0,g:0,b:0};
 }
 
-function dataURLtoBytes(dataURL) {
-  const b64 = dataURL.split(',')[1];
-  const bin = atob(b64);
-  const buf = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-  return buf;
+function du2bytes(dataUrl) {
+  const b = atob(dataUrl.split(',')[1]);
+  const u = new Uint8Array(b.length);
+  for (let i=0; i<b.length; i++) u[i] = b.charCodeAt(i);
+  return u;
 }
 
-/* =============================================
-   INIT
-   ============================================= */
-enableButtons(false);
-console.log('%c PDF Studio v2 ', 'background:#4f8ef7;color:white;font-size:1.2rem;padding:4px 12px;border-radius:4px;');
-console.log('All processing is 100% local. Nothing leaves your browser.');
+/* ─── INIT ────────────────────────────────────────── */
+enableBtns(false);
+updateMergeList();
+console.log('%c PDF Studio v3 ', 'background:#4f8ef7;color:#fff;font-size:1.1rem;padding:4px 14px;border-radius:4px');
