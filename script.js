@@ -1,7 +1,7 @@
 /**
- * PDF Studio — script.js
- * Client-side PDF editor using PDF.js, pdf-lib, and SortableJS
- * No backend required. All processing is local.
+ * PDF Studio — script.js  (v2 — fully fixed)
+ * Client-side PDF editor: PDF.js + pdf-lib + SortableJS
+ * All processing is local — nothing is uploaded anywhere.
  */
 
 'use strict';
@@ -12,88 +12,84 @@
 const CONFIG = {
   MAX_FILE_SIZE_MB: 50,
   PDF_JS_WORKER: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
-  THUMB_SCALE: 0.3,    // Thumbnail render scale
-  PREVIEW_SCALE: 1.5,  // Preview canvas scale
+  THUMB_SCALE: 0.28,
+  PREVIEW_SCALE: 1.4,
   ZOOM_STEP: 0.25,
   ZOOM_MIN: 0.5,
   ZOOM_MAX: 3.0,
 };
 
-// Set up PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = CONFIG.PDF_JS_WORKER;
 
 /* =============================================
-   APP STATE
+   STATE
    ============================================= */
 const state = {
-  pdfDoc: null,           // PDFDocument (pdf-lib) — the editable document
-  pdfJsDoc: null,         // PDFDocumentProxy (PDF.js) — for rendering
-  rawBytes: null,         // Original uploaded PDF bytes (Uint8Array)
-  pageOrder: [],          // Current page order [0-indexed original indices]
-  pageRotations: {},      // { pageIndex: additionalDegrees }
+  pdfJsDoc: null,         // PDF.js doc — for rendering
+  rawBytes: null,         // Uint8Array — always the LATEST edited bytes
+  pageOrder: [],          // [originalIndex, ...] in current display order
+  pageRotations: {},      // { originalIndex: extraDegrees }
   selectedPages: new Set(),
   currentPreviewPage: 1,
   totalPages: 0,
   zoomLevel: 1.0,
   isDarkMode: true,
-  // Merge state
   mergeFiles: [],
-  // Signature state
   sigDrawing: false,
-  sigLastX: 0,
-  sigLastY: 0,
+  placementMode: null,    // null | 'text' | 'image' | 'signature'
 };
 
 /* =============================================
    DOM HELPERS
    ============================================= */
 const $ = id => document.getElementById(id);
-const show = el => el.classList.remove('hidden');
-const hide = el => el.classList.add('hidden');
+const show = el => el && el.classList.remove('hidden');
+const hide = el => el && el.classList.add('hidden');
 
-/** Display a toast notification */
-function showToast(msg, type = 'info', duration = 3000) {
-  const toast = $('toast');
-  toast.textContent = msg;
-  toast.className = `toast ${type}`;
-  show(toast);
-  clearTimeout(toast._timer);
-  toast._timer = setTimeout(() => hide(toast), duration);
+function showToast(msg, type = 'info', duration = 4000) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = `toast ${type}`;
+  show(t);
+  clearTimeout(t._t);
+  t._t = setTimeout(() => hide(t), duration);
 }
 
-/** Show/hide the loading overlay */
 function setLoading(visible, text = 'Processing…') {
-  const overlay = $('loadingOverlay');
   $('loadingText').textContent = text;
-  visible ? show(overlay) : hide(overlay);
+  visible ? show($('loadingOverlay')) : hide($('loadingOverlay'));
 }
 
-/** Toggle password field visibility */
 function togglePwd(id) {
   const el = $(id);
   el.type = el.type === 'password' ? 'text' : 'password';
 }
-window.togglePwd = togglePwd; // expose to inline HTML
+window.togglePwd = togglePwd;
 
-/** Format bytes to human-readable */
 function formatSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(2) + ' MB';
 }
 
-/** Validate file size */
 function validateFileSize(file) {
-  const sizeMB = file.size / (1024 * 1024);
-  if (sizeMB > CONFIG.MAX_FILE_SIZE_MB) {
-    showToast(`File too large: ${formatSize(file.size)}. Max is ${CONFIG.MAX_FILE_SIZE_MB} MB.`, 'error');
+  if (file.size / 1048576 > CONFIG.MAX_FILE_SIZE_MB) {
+    showToast(`File too large (${formatSize(file.size)}). Max ${CONFIG.MAX_FILE_SIZE_MB} MB.`, 'error');
+    return false;
+  }
+  return true;
+}
+
+function validPage(n) {
+  if (isNaN(n) || n < 1 || n > state.totalPages) {
+    showToast(`Invalid page number. Must be 1–${state.totalPages}.`, 'error');
     return false;
   }
   return true;
 }
 
 /* =============================================
-   DARK MODE TOGGLE
+   DARK MODE
    ============================================= */
 $('themeToggle').addEventListener('click', () => {
   state.isDarkMode = !state.isDarkMode;
@@ -104,224 +100,247 @@ $('themeToggle').addEventListener('click', () => {
 });
 
 /* =============================================
-   TOOL PANEL NAVIGATION
+   PANEL NAVIGATION
    ============================================= */
 document.querySelectorAll('.tool-btn').forEach(btn => {
   btn.addEventListener('click', () => {
-    const target = btn.dataset.panel;
-
-    // Update active button
     document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-
-    // Update active panel
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-    $(`panel-${target}`).classList.add('active');
-
-    // Refresh pages panel if switching to it
-    if (target === 'pages' && state.pdfJsDoc) renderPageGrid();
+    $(`panel-${btn.dataset.panel}`).classList.add('active');
+    if (btn.dataset.panel === 'pages' && state.pdfJsDoc) renderPageGrid();
   });
 });
 
 /* =============================================
-   UPLOAD MODULE
+   UPLOAD
    ============================================= */
 
-/** Handle a single PDF file upload */
+/**
+ * Core loader — given Uint8Array bytes, sets up both
+ * PDF.js (for rendering) and tracks rawBytes (for editing).
+ * isNewFile=true resets page order; false preserves it after edits.
+ */
+async function loadBytesIntoState(bytes, isNewFile = true) {
+  state.rawBytes = bytes;
+  // PDF.js needs its own copy of the buffer
+  state.pdfJsDoc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+  state.totalPages = state.pdfJsDoc.numPages;
+
+  if (isNewFile) {
+    state.pageOrder = Array.from({ length: state.totalPages }, (_, i) => i);
+    state.pageRotations = {};
+    state.selectedPages.clear();
+    state.currentPreviewPage = 1;
+  }
+}
+
 async function handleFileUpload(file) {
   if (!file || file.type !== 'application/pdf') {
-    showToast('Please select a valid PDF file.', 'error');
-    return;
+    showToast('Please select a valid PDF file.', 'error'); return;
   }
   if (!validateFileSize(file)) return;
 
   setLoading(true, 'Loading PDF…');
   try {
-    const arrayBuffer = await file.arrayBuffer();
-    const bytes = new Uint8Array(arrayBuffer);
+    const buf = await file.arrayBuffer();
+    await loadBytesIntoState(new Uint8Array(buf), true);
 
-    // Load with pdf-lib (for editing)
-    state.pdfDoc = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
-    state.rawBytes = bytes;
-
-    // Load with PDF.js (for rendering)
-    state.pdfJsDoc = await pdfjsLib.getDocument({ data: bytes }).promise;
-    state.totalPages = state.pdfJsDoc.numPages;
-
-    // Init page order (0-indexed)
-    state.pageOrder = Array.from({ length: state.totalPages }, (_, i) => i);
-    state.pageRotations = {};
-    state.selectedPages.clear();
-    state.currentPreviewPage = 1;
-
-    // Update UI
-    updateFileInfo(file);
-    updatePageControls();
-    updateSplitPageHint();
-    enableToolButtons();
-    await renderPreview();
-
+    $('fileName').textContent = file.name;
+    $('fileSize').textContent = `${formatSize(file.size)} · ${state.totalPages} pages`;
+    hide($('dropZone'));
+    show($('fileInfo'));
+    enableButtons(true);
+    updateSplitHint();
+    await renderPreview(1);
     showToast(`Loaded: ${file.name} (${state.totalPages} pages)`, 'success');
   } catch (err) {
     console.error('Upload error:', err);
-    showToast('Failed to load PDF. It may be corrupted or encrypted.', 'error');
+    showToast(`Failed to load: ${err.message}`, 'error');
   } finally {
     setLoading(false);
   }
 }
 
-/** Update file info display */
-function updateFileInfo(file) {
-  $('fileName').textContent = file.name;
-  $('fileSize').textContent = `${formatSize(file.size)} · ${state.totalPages} pages`;
-  hide($('dropZone'));
-  show($('fileInfo'));
+function enableButtons(on) {
+  ['downloadBtn','splitBtn','addTextBtn','addImageBtn','addSigBtn','applyPwdBtn','zoomIn','zoomOut']
+    .forEach(id => { const el = $(id); if (el) el.disabled = !on; });
+  updatePageControls();
 }
 
-/** Enable all tool buttons after PDF is loaded */
-function enableToolButtons() {
-  $('downloadBtn').disabled = false;
-  $('splitBtn').disabled = false;
-  $('addTextBtn').disabled = false;
-  $('addImageBtn').disabled = false;
-  $('addSigBtn').disabled = false;
-  $('applyPwdBtn').disabled = false;
-  $('prevPage').disabled = state.currentPreviewPage <= 1;
-  $('nextPage').disabled = state.currentPreviewPage >= state.totalPages;
-  $('zoomIn').disabled = false;
-  $('zoomOut').disabled = false;
-}
-
-// File input via button
 $('fileInput').addEventListener('change', e => {
   if (e.target.files[0]) handleFileUpload(e.target.files[0]);
 });
 
-// Drag and drop on drop zone
 const dropZone = $('dropZone');
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
 dropZone.addEventListener('drop', e => {
-  e.preventDefault();
-  dropZone.classList.remove('drag-over');
-  const file = e.dataTransfer.files[0];
-  if (file) handleFileUpload(file);
+  e.preventDefault(); dropZone.classList.remove('drag-over');
+  if (e.dataTransfer.files[0]) handleFileUpload(e.dataTransfer.files[0]);
 });
-
-// Global drag-over prevention
 document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => { if (e.target !== dropZone) e.preventDefault(); });
 
-// Clear file
 $('clearFile').addEventListener('click', () => {
-  state.pdfDoc = null;
-  state.pdfJsDoc = null;
-  state.rawBytes = null;
-  state.pageOrder = [];
-  state.pageRotations = {};
+  Object.assign(state, {
+    pdfJsDoc: null, rawBytes: null,
+    pageOrder: [], pageRotations: {},
+    totalPages: 0, currentPreviewPage: 1,
+  });
   state.selectedPages.clear();
-  state.totalPages = 0;
-
-  show($('dropZone'));
-  hide($('fileInfo'));
+  show($('dropZone')); hide($('fileInfo'));
   $('fileInput').value = '';
-
-  // Reset preview
   $('pageIndicator').textContent = '— / —';
   hide($('previewCanvas'));
-  document.querySelector('.preview-placeholder').style.display = '';
-
-  // Disable buttons
-  $('downloadBtn').disabled = true;
-  $('splitBtn').disabled = true;
-  $('addTextBtn').disabled = true;
-  $('addImageBtn').disabled = true;
-  $('addSigBtn').disabled = true;
-  $('applyPwdBtn').disabled = true;
-  $('prevPage').disabled = true;
-  $('nextPage').disabled = true;
-  $('zoomIn').disabled = true;
-  $('zoomOut').disabled = true;
-
-  // Reset page grid
+  show($('previewPlaceholder'));
   $('pageGrid').innerHTML = '<p class="hint center">Upload a PDF to manage pages.</p>';
+  const po = $('placementOverlay');
+  if (po) po.getContext('2d').clearRect(0, 0, po.width, po.height);
+  enableButtons(false);
 });
 
 /* =============================================
-   PREVIEW MODULE
+   PREVIEW
    ============================================= */
-
-/** Render a specific page to the preview canvas using PDF.js */
-async function renderPreview(pageNum = state.currentPreviewPage) {
+async function renderPreview(pageNum) {
   if (!state.pdfJsDoc) return;
-  pageNum = Math.max(1, Math.min(pageNum, state.totalPages));
+  pageNum = Math.max(1, Math.min(pageNum ?? state.currentPreviewPage, state.totalPages));
   state.currentPreviewPage = pageNum;
 
-  // Get the actual page index from our current order
-  const orderedIndex = state.pageOrder[pageNum - 1]; // 0-indexed
-  const pdfJsPage = await state.pdfJsDoc.getPage(orderedIndex + 1); // PDF.js is 1-indexed
+  const origIdx = state.pageOrder[pageNum - 1];
+  const pdfPage = await state.pdfJsDoc.getPage(origIdx + 1);
+  const addRot  = state.pageRotations[origIdx] || 0;
 
-  // Apply rotation
-  const addedRotation = state.pageRotations[orderedIndex] || 0;
-  const viewport = pdfJsPage.getViewport({
+  const viewport = pdfPage.getViewport({
     scale: CONFIG.PREVIEW_SCALE * state.zoomLevel,
-    rotation: (pdfJsPage.rotate + addedRotation) % 360,
+    rotation: (pdfPage.rotate + addRot) % 360,
   });
 
   const canvas = $('previewCanvas');
-  const ctx = canvas.getContext('2d');
-  canvas.width = viewport.width;
+  canvas.width  = viewport.width;
   canvas.height = viewport.height;
-
   show(canvas);
-  document.querySelector('.preview-placeholder').style.display = 'none';
+  hide($('previewPlaceholder'));
 
-  await pdfJsPage.render({ canvasContext: ctx, viewport }).promise;
+  await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
   updatePageControls();
+
+  // Keep placement overlay in sync with canvas size
+  const overlay = $('placementOverlay');
+  if (overlay) { overlay.width = canvas.width; overlay.height = canvas.height; }
 }
 
-/** Update page indicator and nav buttons */
 function updatePageControls() {
   $('pageIndicator').textContent = state.totalPages
-    ? `${state.currentPreviewPage} / ${state.totalPages}`
-    : '— / —';
-  $('prevPage').disabled = state.currentPreviewPage <= 1;
-  $('nextPage').disabled = state.currentPreviewPage >= state.totalPages;
+    ? `${state.currentPreviewPage} / ${state.totalPages}` : '— / —';
+  $('prevPage').disabled = !state.totalPages || state.currentPreviewPage <= 1;
+  $('nextPage').disabled = !state.totalPages || state.currentPreviewPage >= state.totalPages;
 }
 
-// Navigation
-$('prevPage').addEventListener('click', () => {
-  if (state.currentPreviewPage > 1) renderPreview(state.currentPreviewPage - 1);
-});
-$('nextPage').addEventListener('click', () => {
-  if (state.currentPreviewPage < state.totalPages) renderPreview(state.currentPreviewPage + 1);
-});
+$('prevPage').addEventListener('click', () => renderPreview(state.currentPreviewPage - 1));
+$('nextPage').addEventListener('click', () => renderPreview(state.currentPreviewPage + 1));
 
-// Zoom
 $('zoomIn').addEventListener('click', () => {
-  if (state.zoomLevel < CONFIG.ZOOM_MAX) {
-    state.zoomLevel = Math.min(CONFIG.ZOOM_MAX, state.zoomLevel + CONFIG.ZOOM_STEP);
-    $('zoomLabel').textContent = Math.round(state.zoomLevel * 100) + '%';
-    renderPreview();
-  }
+  state.zoomLevel = Math.min(CONFIG.ZOOM_MAX, +(state.zoomLevel + CONFIG.ZOOM_STEP).toFixed(2));
+  $('zoomLabel').textContent = Math.round(state.zoomLevel * 100) + '%';
+  renderPreview();
 });
 $('zoomOut').addEventListener('click', () => {
-  if (state.zoomLevel > CONFIG.ZOOM_MIN) {
-    state.zoomLevel = Math.max(CONFIG.ZOOM_MIN, state.zoomLevel - CONFIG.ZOOM_STEP);
-    $('zoomLabel').textContent = Math.round(state.zoomLevel * 100) + '%';
-    renderPreview();
-  }
+  state.zoomLevel = Math.max(CONFIG.ZOOM_MIN, +(state.zoomLevel - CONFIG.ZOOM_STEP).toFixed(2));
+  $('zoomLabel').textContent = Math.round(state.zoomLevel * 100) + '%';
+  renderPreview();
 });
 
 /* =============================================
-   MERGE MODULE
+   PLACEMENT OVERLAY
+   Click on the preview canvas to pick X/Y position
+   for text, image, or signature overlays.
    ============================================= */
+function initPlacementOverlay() {
+  const overlay = $('placementOverlay');
+  if (!overlay) return;
 
-/** Update the merge files list and update merge button state */
+  overlay.addEventListener('click', e => {
+    if (!state.placementMode || !state.pdfJsDoc) return;
+
+    const rect = overlay.getBoundingClientRect();
+    const cx = (e.clientX - rect.left) * (overlay.width  / rect.width);
+    const cy = (e.clientY - rect.top)  * (overlay.height / rect.height);
+
+    // Convert from canvas pixels → PDF points (origin top-left, same as our input fields)
+    const scale = CONFIG.PREVIEW_SCALE * state.zoomLevel;
+    const pdfX  = Math.round(cx / scale);
+    const pdfY  = Math.round(cy / scale);
+
+    if (state.placementMode === 'text') {
+      $('textX').value = pdfX; $('textY').value = pdfY;
+    } else if (state.placementMode === 'image') {
+      $('imgX').value = pdfX; $('imgY').value = pdfY;
+    } else if (state.placementMode === 'signature') {
+      $('sigX').value = pdfX; $('sigY').value = pdfY;
+    }
+
+    showToast(`Position set: X=${pdfX}, Y=${pdfY} (measured from top-left)`, 'success');
+
+    // Draw crosshair marker
+    const ctx = overlay.getContext('2d');
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    ctx.strokeStyle = '#4f8ef7';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 3]);
+    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(overlay.width, cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, overlay.height); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#4f8ef7';
+    ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.fill();
+
+    // Draw small label
+    ctx.fillStyle = '#4f8ef7';
+    ctx.font = '12px monospace';
+    ctx.fillText(`(${pdfX}, ${pdfY})`, cx + 10, cy - 6);
+  });
+}
+initPlacementOverlay();
+
+function setPlacementMode(mode, btnId) {
+  // Turn off current mode
+  if (state.placementMode) {
+    const prevBtn = $(`${state.placementMode}PickBtn`);
+    if (prevBtn) {
+      prevBtn.classList.remove('active-pick');
+      prevBtn.innerHTML = '<i class="fa-solid fa-crosshairs"></i> Pick on Page';
+    }
+    const overlay = $('placementOverlay');
+    if (overlay) {
+      overlay.style.pointerEvents = 'none';
+      overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+    }
+    $('previewWrap').classList.remove('placement-active');
+  }
+
+  if (mode && mode !== state.placementMode) {
+    state.placementMode = mode;
+    const overlay = $('placementOverlay');
+    overlay.style.pointerEvents = 'all';
+    $('previewWrap').classList.add('placement-active');
+    if (btnId) {
+      const btn = $(btnId);
+      btn.classList.add('active-pick');
+      btn.innerHTML = '<i class="fa-solid fa-xmark"></i> Cancel Pick';
+    }
+    showToast('Click anywhere on the preview to set the position.', 'info', 5000);
+  } else {
+    state.placementMode = null;
+  }
+}
+
+/* =============================================
+   MERGE
+   ============================================= */
 function updateMergeList() {
   const list = $('mergeList');
   list.innerHTML = '';
-
   state.mergeFiles.forEach((f, i) => {
     const li = document.createElement('li');
     li.className = 'merge-item';
@@ -334,644 +353,499 @@ function updateMergeList() {
       </button>`;
     list.appendChild(li);
   });
-
   $('mergeBtn').disabled = state.mergeFiles.length < 2;
 }
 
-window.removeMergeFile = function(idx) {
-  state.mergeFiles.splice(idx, 1);
-  updateMergeList();
-};
+window.removeMergeFile = i => { state.mergeFiles.splice(i, 1); updateMergeList(); };
 
 $('mergeInput').addEventListener('change', e => {
-  const files = Array.from(e.target.files);
-  const valid = files.filter(f => {
-    if (f.type !== 'application/pdf') { showToast(`Skipped non-PDF: ${f.name}`, 'error'); return false; }
-    if (!validateFileSize(f)) return false;
-    return true;
+  Array.from(e.target.files).forEach(f => {
+    if (f.type !== 'application/pdf') { showToast(`Skipped non-PDF: ${f.name}`, 'error'); return; }
+    if (!validateFileSize(f)) return;
+    state.mergeFiles.push(f);
   });
-  state.mergeFiles.push(...valid);
-  updateMergeList();
-  e.target.value = '';
+  updateMergeList(); e.target.value = '';
 });
 
-// Drag-drop on merge zone
 const mergeDropZone = $('mergeDropZone');
 mergeDropZone.addEventListener('dragover', e => { e.preventDefault(); mergeDropZone.classList.add('drag-over'); });
 mergeDropZone.addEventListener('dragleave', () => mergeDropZone.classList.remove('drag-over'));
 mergeDropZone.addEventListener('drop', e => {
-  e.preventDefault();
-  mergeDropZone.classList.remove('drag-over');
-  const files = Array.from(e.dataTransfer.files);
-  const valid = files.filter(f => f.type === 'application/pdf' && validateFileSize(f));
-  state.mergeFiles.push(...valid);
+  e.preventDefault(); mergeDropZone.classList.remove('drag-over');
+  Array.from(e.dataTransfer.files).forEach(f => {
+    if (f.type === 'application/pdf' && validateFileSize(f)) state.mergeFiles.push(f);
+  });
   updateMergeList();
 });
 
-/** Merge all selected PDFs into one and download */
 $('mergeBtn').addEventListener('click', async () => {
   if (state.mergeFiles.length < 2) return;
-  setLoading(true, 'Merging PDFs…');
+  setLoading(true, `Merging ${state.mergeFiles.length} PDFs…`);
   try {
     const merged = await PDFLib.PDFDocument.create();
-
     for (const file of state.mergeFiles) {
-      const bytes = await file.arrayBuffer();
-      const doc = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
+      const buf  = await file.arrayBuffer();
+      const doc  = await PDFLib.PDFDocument.load(buf, { ignoreEncryption: true });
       const pages = await merged.copyPages(doc, doc.getPageIndices());
       pages.forEach(p => merged.addPage(p));
     }
-
-    const pdfBytes = await merged.save();
-    downloadBytes(pdfBytes, 'merged.pdf');
-    showToast('PDFs merged successfully!', 'success');
+    downloadBytes(await merged.save(), 'merged.pdf');
+    showToast(`Merged ${state.mergeFiles.length} PDFs successfully!`, 'success');
   } catch (err) {
     console.error('Merge error:', err);
-    showToast('Failed to merge PDFs.', 'error');
+    showToast(`Merge failed: ${err.message}`, 'error');
   } finally {
     setLoading(false);
   }
 });
 
 /* =============================================
-   SPLIT MODULE
+   SPLIT
    ============================================= */
-
-function updateSplitPageHint() {
-  $('splitPageCount').textContent = state.totalPages
-    ? `Document has ${state.totalPages} pages`
-    : '';
+function updateSplitHint() {
+  $('splitPageCount').textContent = state.totalPages ? `Document has ${state.totalPages} pages` : '';
   if (state.totalPages) {
     $('splitTo').value = state.totalPages;
-    $('splitTo').max = state.totalPages;
-    $('splitFrom').max = state.totalPages;
+    $('splitFrom').max = $('splitTo').max = state.totalPages;
   }
 }
 
-/** Extract a page range and download as new PDF */
 $('splitBtn').addEventListener('click', async () => {
-  if (!state.pdfDoc) return;
-
+  if (!state.rawBytes) return;
   const from = parseInt($('splitFrom').value, 10);
-  const to = parseInt($('splitTo').value, 10);
-
+  const to   = parseInt($('splitTo').value,   10);
   if (isNaN(from) || isNaN(to) || from < 1 || to > state.totalPages || from > to) {
-    showToast('Invalid page range.', 'error');
-    return;
+    showToast('Invalid page range.', 'error'); return;
   }
-
-  setLoading(true, 'Splitting PDF…');
+  setLoading(true, 'Extracting pages…');
   try {
-    const bytes = await getRebuildBytes();
-    const srcDoc = await PDFLib.PDFDocument.load(bytes);
-    const newDoc = await PDFLib.PDFDocument.create();
-
-    // Pages are 0-indexed in pdf-lib
-    const indices = Array.from({ length: to - from + 1 }, (_, i) => from - 1 + i);
-    const copied = await newDoc.copyPages(srcDoc, indices);
-    copied.forEach(p => newDoc.addPage(p));
-
-    const pdfBytes = await newDoc.save();
-    downloadBytes(pdfBytes, `split_pages_${from}-${to}.pdf`);
+    // Load DIRECTLY from rawBytes — no rebuild needed for split
+    const src  = await PDFLib.PDFDocument.load(state.rawBytes, { ignoreEncryption: true });
+    const dest = await PDFLib.PDFDocument.create();
+    const idxs = Array.from({ length: to - from + 1 }, (_, i) => from - 1 + i);
+    const pages = await dest.copyPages(src, idxs);
+    pages.forEach(p => dest.addPage(p));
+    downloadBytes(await dest.save(), `pages_${from}-${to}.pdf`);
     showToast(`Extracted pages ${from}–${to}`, 'success');
   } catch (err) {
     console.error('Split error:', err);
-    showToast('Failed to split PDF.', 'error');
+    showToast(`Split failed: ${err.message}`, 'error');
   } finally {
     setLoading(false);
   }
 });
 
 /* =============================================
-   PAGES MODULE (Manage, Reorder, Rotate, Delete)
+   PAGES — Manage / Reorder / Delete / Rotate
    ============================================= */
-
 let sortableInstance = null;
 
-/** Render thumbnail grid for page management */
 async function renderPageGrid() {
   if (!state.pdfJsDoc) return;
   const grid = $('pageGrid');
   grid.innerHTML = '';
-
-  for (let i = 0; i < state.pageOrder.length; i++) {
-    const originalIdx = state.pageOrder[i];
-    const pdfJsPage = await state.pdfJsDoc.getPage(originalIdx + 1);
-    const addedRotation = state.pageRotations[originalIdx] || 0;
-    const viewport = pdfJsPage.getViewport({
-      scale: CONFIG.THUMB_SCALE,
-      rotation: (pdfJsPage.rotate + addedRotation) % 360,
-    });
-
-    const thumb = document.createElement('div');
-    thumb.className = 'page-thumb';
-    thumb.dataset.order = i;
-    if (state.selectedPages.has(i)) thumb.classList.add('selected');
-
-    const canvas = document.createElement('canvas');
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    await pdfJsPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-
-    const label = document.createElement('div');
-    label.className = 'page-thumb-label';
-    label.textContent = `Page ${i + 1}`;
-
-    const selectBadge = document.createElement('div');
-    selectBadge.className = 'page-thumb-select';
-    selectBadge.innerHTML = '<i class="fa-solid fa-check" style="font-size:0.6rem"></i>';
-
-    thumb.appendChild(canvas);
-    thumb.appendChild(label);
-    thumb.appendChild(selectBadge);
-
-    if (addedRotation) {
-      const badge = document.createElement('div');
-      badge.className = 'page-rotation-badge';
-      badge.textContent = `${addedRotation}°`;
-      thumb.appendChild(badge);
-    }
-
-    // Click to select/deselect
-    thumb.addEventListener('click', () => {
-      const orderIdx = parseInt(thumb.dataset.order, 10);
-      if (state.selectedPages.has(orderIdx)) {
-        state.selectedPages.delete(orderIdx);
-        thumb.classList.remove('selected');
-      } else {
-        state.selectedPages.add(orderIdx);
-        thumb.classList.add('selected');
-      }
-      updatePageToolbarState();
-    });
-
-    grid.appendChild(thumb);
-  }
-
-  // Init or reinit SortableJS
-  if (sortableInstance) sortableInstance.destroy();
-  sortableInstance = Sortable.create(grid, {
-    animation: 180,
-    ghostClass: 'sortable-ghost',
-    onEnd(evt) {
-      // Reorder the pageOrder array
-      const movedPage = state.pageOrder.splice(evt.oldIndex, 1)[0];
-      state.pageOrder.splice(evt.newIndex, 0, movedPage);
-
-      // Update order indices on thumbs
-      grid.querySelectorAll('.page-thumb').forEach((el, i) => {
-        el.dataset.order = i;
-        el.querySelector('.page-thumb-label').textContent = `Page ${i + 1}`;
+  setLoading(true, 'Rendering page thumbnails…');
+  try {
+    for (let i = 0; i < state.pageOrder.length; i++) {
+      const origIdx = state.pageOrder[i];
+      const page    = await state.pdfJsDoc.getPage(origIdx + 1);
+      const addRot  = state.pageRotations[origIdx] || 0;
+      const vp      = page.getViewport({
+        scale: CONFIG.THUMB_SCALE,
+        rotation: (page.rotate + addRot) % 360,
       });
 
-      // Remap selected pages after reorder
-      state.selectedPages.clear();
-      showToast('Pages reordered. Download to save.', 'info');
-    }
-  });
+      const thumb = document.createElement('div');
+      thumb.className = 'page-thumb';
+      thumb.dataset.order = i;
+      if (state.selectedPages.has(i)) thumb.classList.add('selected');
 
+      const canvas = document.createElement('canvas');
+      canvas.width = vp.width; canvas.height = vp.height;
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+
+      const label = document.createElement('div');
+      label.className = 'page-thumb-label';
+      label.textContent = `Page ${i + 1}`;
+
+      const badge = document.createElement('div');
+      badge.className = 'page-thumb-select';
+      badge.innerHTML = '<i class="fa-solid fa-check" style="font-size:0.6rem"></i>';
+
+      thumb.append(canvas, label, badge);
+
+      if (addRot) {
+        const rb = document.createElement('div');
+        rb.className = 'page-rotation-badge';
+        rb.textContent = `${addRot}°`;
+        thumb.appendChild(rb);
+      }
+
+      thumb.addEventListener('click', () => {
+        const idx = parseInt(thumb.dataset.order, 10);
+        if (state.selectedPages.has(idx)) {
+          state.selectedPages.delete(idx); thumb.classList.remove('selected');
+        } else {
+          state.selectedPages.add(idx); thumb.classList.add('selected');
+        }
+        updatePageToolbarState();
+      });
+
+      grid.appendChild(thumb);
+    }
+
+    if (sortableInstance) sortableInstance.destroy();
+    sortableInstance = Sortable.create(grid, {
+      animation: 180,
+      ghostClass: 'sortable-ghost',
+      onEnd(evt) {
+        const moved = state.pageOrder.splice(evt.oldIndex, 1)[0];
+        state.pageOrder.splice(evt.newIndex, 0, moved);
+        grid.querySelectorAll('.page-thumb').forEach((el, i) => {
+          el.dataset.order = i;
+          el.querySelector('.page-thumb-label').textContent = `Page ${i + 1}`;
+        });
+        state.selectedPages.clear();
+        showToast('Pages reordered. Download to save changes.', 'info');
+      },
+    });
+  } finally {
+    setLoading(false);
+  }
   updatePageToolbarState();
 }
 
-/** Enable/disable page toolbar buttons based on selection */
 function updatePageToolbarState() {
-  const hasSelection = state.selectedPages.size > 0;
-  $('deleteSelectedBtn').disabled = !hasSelection;
-  $('rotateLeftBtn').disabled  = !hasSelection;
-  $('rotateRightBtn').disabled = !hasSelection;
+  const has = state.selectedPages.size > 0;
+  $('deleteSelectedBtn').disabled = !has;
+  $('rotateLeftBtn').disabled  = !has;
+  $('rotateRightBtn').disabled = !has;
 }
 
-// Select all / deselect all
 $('selectAllBtn').addEventListener('click', () => {
   for (let i = 0; i < state.pageOrder.length; i++) state.selectedPages.add(i);
   document.querySelectorAll('.page-thumb').forEach(t => t.classList.add('selected'));
   updatePageToolbarState();
 });
-
 $('deselectAllBtn').addEventListener('click', () => {
   state.selectedPages.clear();
   document.querySelectorAll('.page-thumb').forEach(t => t.classList.remove('selected'));
   updatePageToolbarState();
 });
 
-/** Delete selected pages from pageOrder */
 $('deleteSelectedBtn').addEventListener('click', async () => {
   if (!state.selectedPages.size) return;
-
-  if (!confirm(`Delete ${state.selectedPages.size} page(s)? This cannot be undone.`)) return;
   if (state.selectedPages.size >= state.pageOrder.length) {
-    showToast('Cannot delete all pages.', 'error');
-    return;
+    showToast('Cannot delete all pages.', 'error'); return;
   }
+  if (!confirm(`Delete ${state.selectedPages.size} page(s)? This cannot be undone.`)) return;
 
-  // Remove selected indices from pageOrder (sort descending to avoid index shift)
-  const toDelete = [...state.selectedPages].sort((a, b) => b - a);
-  toDelete.forEach(i => state.pageOrder.splice(i, 1));
-
+  [...state.selectedPages].sort((a, b) => b - a).forEach(i => state.pageOrder.splice(i, 1));
   state.selectedPages.clear();
   state.totalPages = state.pageOrder.length;
+  state.currentPreviewPage = Math.min(state.currentPreviewPage, state.totalPages);
   updatePageControls();
-  updateSplitPageHint();
-
+  updateSplitHint();
   await renderPageGrid();
+  renderPreview(state.currentPreviewPage);
   showToast('Pages deleted.', 'success');
 });
 
-/** Rotate selected pages */
-async function rotateSelected(degrees) {
+async function rotateSelected(deg) {
   if (!state.selectedPages.size) return;
-
+  const count = state.selectedPages.size;
   state.selectedPages.forEach(orderIdx => {
     const origIdx = state.pageOrder[orderIdx];
-    state.pageRotations[origIdx] = ((state.pageRotations[origIdx] || 0) + degrees + 360) % 360;
+    state.pageRotations[origIdx] = ((state.pageRotations[origIdx] || 0) + deg + 360) % 360;
   });
-
+  state.selectedPages.clear();
   await renderPageGrid();
-  if (state.selectedPages.size > 0) {
-    // Re-select them (renderPageGrid clears selection)
-    showToast(`Rotated ${state.selectedPages.size} page(s).`, 'success');
-    state.selectedPages.clear();
-  }
-
-  renderPreview();
+  renderPreview(state.currentPreviewPage);
+  showToast(`Rotated ${count} page(s).`, 'success');
 }
-
-$('rotateLeftBtn').addEventListener('click', () => rotateSelected(-90));
+$('rotateLeftBtn').addEventListener('click',  () => rotateSelected(-90));
 $('rotateRightBtn').addEventListener('click', () => rotateSelected(90));
 
 /* =============================================
-   TEXT OVERLAY MODULE
+   CORE: getRebuildBytes
+   Applies current pageOrder + rotations to rawBytes.
+   Returns a new Uint8Array representing the full edited PDF.
    ============================================= */
+async function getRebuildBytes() {
+  if (!state.rawBytes) throw new Error('No PDF loaded');
+  const src    = await PDFLib.PDFDocument.load(state.rawBytes, { ignoreEncryption: true });
+  const newDoc = await PDFLib.PDFDocument.create();
+  // Copy pages in current display order
+  const pages  = await newDoc.copyPages(src, state.pageOrder);
+  pages.forEach((page, i) => {
+    const origIdx = state.pageOrder[i];
+    const addRot  = state.pageRotations[origIdx] || 0;
+    if (addRot) {
+      page.setRotation(PDFLib.degrees((page.getRotation().angle + addRot) % 360));
+    }
+    newDoc.addPage(page);
+  });
+  return newDoc.save();
+}
 
-/** Add a text overlay to the specified page */
+/**
+ * After any edit that changes page content (text/image/sig),
+ * persist the result so future edits chain correctly.
+ * After save, rawBytes represent a linear 1-N page doc, so reset order.
+ */
+async function applyNewBytes(bytes) {
+  const prevPage = state.currentPreviewPage;
+  // After getRebuildBytes + edit, the resulting doc has pages in order 0..N-1
+  state.rawBytes = bytes;
+  state.pdfJsDoc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+  state.totalPages = state.pdfJsDoc.numPages;
+  state.pageOrder = Array.from({ length: state.totalPages }, (_, i) => i);
+  state.pageRotations = {};
+  state.currentPreviewPage = Math.min(prevPage, state.totalPages);
+  updatePageControls();
+  updateSplitHint();
+  await renderPreview(state.currentPreviewPage);
+}
+
+/* =============================================
+   TEXT OVERLAY
+   ============================================= */
+$('textPickBtn').addEventListener('click', () => {
+  setPlacementMode(state.placementMode === 'text' ? null : 'text', 'textPickBtn');
+});
+
 $('addTextBtn').addEventListener('click', async () => {
-  if (!state.pdfDoc) return;
-
+  if (!state.rawBytes) return;
   const text = $('overlayText').value.trim();
-  if (!text) { showToast('Please enter text.', 'error'); return; }
-
+  if (!text) { showToast('Please enter some text.', 'error'); return; }
   const pageNum = parseInt($('textPage').value, 10);
-  if (isNaN(pageNum) || pageNum < 1 || pageNum > state.totalPages) {
-    showToast('Invalid page number.', 'error'); return;
-  }
-
-  const size   = parseFloat($('textSize').value) || 24;
-  const x      = parseFloat($('textX').value) || 0;
-  const yTop   = parseFloat($('textY').value) || 0;
-  const color  = hexToRgb($('textColor').value);
+  if (!validPage(pageNum)) return;
+  const size  = Math.max(1, parseFloat($('textSize').value) || 24);
+  const x     = parseFloat($('textX').value)     || 0;
+  const yTop  = parseFloat($('textY').value)     || 0;
+  const color = hexToRgb($('textColor').value);
 
   setLoading(true, 'Adding text…');
   try {
-    const bytes = await getRebuildBytes();
-    const doc = await PDFLib.PDFDocument.load(bytes);
-    const pages = doc.getPages();
-    const page = pages[pageNum - 1];
+    // Build with page order/rotations baked in first
+    const base = await getRebuildBytes();
+    const doc  = await PDFLib.PDFDocument.load(base, { ignoreEncryption: true });
+    const font = await doc.embedFont(PDFLib.StandardFonts.Helvetica);
+    const page = doc.getPages()[pageNum - 1];
     const { height } = page.getSize();
-
-    // Convert from "top-down" Y to PDF "bottom-up" Y
-    const yPdf = height - yTop - size;
-
+    // Input Y is from top; PDF origin is bottom-left, so invert
     page.drawText(text, {
-      x, y: yPdf,
-      size,
+      x, y: height - yTop - size, size, font,
       color: PDFLib.rgb(color.r / 255, color.g / 255, color.b / 255),
-      font: await doc.embedFont(PDFLib.StandardFonts.Helvetica),
     });
-
-    const newBytes = await doc.save();
-    await reloadFromBytes(newBytes);
-    showToast('Text added!', 'success');
+    await applyNewBytes(await doc.save());
+    setPlacementMode(null);
+    showToast('Text added! Preview updated.', 'success');
   } catch (err) {
-    console.error('Text overlay error:', err);
-    showToast('Failed to add text.', 'error');
+    console.error('Text error:', err);
+    showToast(`Failed to add text: ${err.message}`, 'error');
   } finally {
     setLoading(false);
   }
 });
 
 /* =============================================
-   IMAGE OVERLAY MODULE
+   IMAGE OVERLAY
    ============================================= */
+$('imgPickBtn').addEventListener('click', () => {
+  setPlacementMode(state.placementMode === 'image' ? null : 'image', 'imgPickBtn');
+});
 
-/** Embed an image onto a page */
 $('addImageBtn').addEventListener('click', async () => {
-  if (!state.pdfDoc) return;
-
-  const fileInput = $('overlayImageInput');
-  if (!fileInput.files[0]) { showToast('Please select an image file.', 'error'); return; }
-
-  const file = fileInput.files[0];
+  if (!state.rawBytes) return;
+  const fileEl = $('overlayImageInput');
+  if (!fileEl.files[0]) { showToast('Please select an image file.', 'error'); return; }
+  const file    = fileEl.files[0];
   const pageNum = parseInt($('imgPage').value, 10);
-  if (isNaN(pageNum) || pageNum < 1 || pageNum > state.totalPages) {
-    showToast('Invalid page number.', 'error'); return;
-  }
-
+  if (!validPage(pageNum)) return;
   const x    = parseFloat($('imgX').value) || 0;
   const yTop = parseFloat($('imgY').value) || 0;
-  const w    = parseFloat($('imgW').value) || 100;
-  const h    = parseFloat($('imgH').value) || 80;
+  const w    = parseFloat($('imgW').value) || 150;
+  const h    = parseFloat($('imgH').value) || 100;
 
   setLoading(true, 'Embedding image…');
   try {
-    const bytes = await getRebuildBytes();
-    const doc = await PDFLib.PDFDocument.load(bytes);
-    const imgBytes = await file.arrayBuffer();
-
-    let embeddedImg;
-    if (file.type === 'image/png') {
-      embeddedImg = await doc.embedPng(imgBytes);
-    } else if (file.type === 'image/jpeg' || file.type === 'image/jpg') {
-      embeddedImg = await doc.embedJpg(imgBytes);
-    } else {
-      showToast('Only PNG and JPEG images are supported.', 'error');
-      setLoading(false);
-      return;
-    }
-
-    const pages = doc.getPages();
-    const page = pages[pageNum - 1];
-    const { height } = page.getSize();
-    const yPdf = height - yTop - h;
-
-    page.drawImage(embeddedImg, { x, y: yPdf, width: w, height: h });
-
-    const newBytes = await doc.save();
-    await reloadFromBytes(newBytes);
-    showToast('Image embedded!', 'success');
+    const base   = await getRebuildBytes();
+    const doc    = await PDFLib.PDFDocument.load(base, { ignoreEncryption: true });
+    const imgBuf = await file.arrayBuffer();
+    let img;
+    if      (file.type === 'image/png')  img = await doc.embedPng(imgBuf);
+    else if (file.type === 'image/jpeg' || file.type === 'image/jpg') img = await doc.embedJpg(imgBuf);
+    else { showToast('Only PNG and JPEG images supported.', 'error'); setLoading(false); return; }
+    const page = doc.getPages()[pageNum - 1];
+    page.drawImage(img, { x, y: page.getSize().height - yTop - h, width: w, height: h });
+    await applyNewBytes(await doc.save());
+    setPlacementMode(null);
+    showToast('Image embedded! Preview updated.', 'success');
   } catch (err) {
-    console.error('Image overlay error:', err);
-    showToast('Failed to embed image.', 'error');
+    console.error('Image error:', err);
+    showToast(`Failed to embed image: ${err.message}`, 'error');
   } finally {
     setLoading(false);
   }
 });
 
 /* =============================================
-   SIGNATURE MODULE (Canvas-based drawing)
+   SIGNATURE
    ============================================= */
-
 const sigCanvas = $('sigCanvas');
-const sigCtx = sigCanvas.getContext('2d');
+const sigCtx    = sigCanvas.getContext('2d');
 
-/** Clear the signature canvas */
-function clearSignature() {
+$('clearSig').addEventListener('click', () => {
   sigCtx.clearRect(0, 0, sigCanvas.width, sigCanvas.height);
-}
-$('clearSig').addEventListener('click', clearSignature);
+});
 
-/** Get position relative to canvas */
 function getSigPos(e) {
   const rect = sigCanvas.getBoundingClientRect();
-  const scaleX = sigCanvas.width / rect.width;
-  const scaleY = sigCanvas.height / rect.height;
-  const src = e.touches ? e.touches[0] : e;
+  const src  = e.touches ? e.touches[0] : e;
   return {
-    x: (src.clientX - rect.left) * scaleX,
-    y: (src.clientY - rect.top) * scaleY,
+    x: (src.clientX - rect.left) * (sigCanvas.width  / rect.width),
+    y: (src.clientY - rect.top)  * (sigCanvas.height / rect.height),
   };
 }
 
-function sigStart(e) {
-  e.preventDefault();
-  state.sigDrawing = true;
-  const pos = getSigPos(e);
-  state.sigLastX = pos.x;
-  state.sigLastY = pos.y;
-  sigCtx.beginPath();
-  sigCtx.moveTo(pos.x, pos.y);
-}
-
-function sigMove(e) {
-  e.preventDefault();
-  if (!state.sigDrawing) return;
-  const pos = getSigPos(e);
+// Mouse
+sigCanvas.addEventListener('mousedown', e => {
+  e.preventDefault(); state.sigDrawing = true;
+  const p = getSigPos(e); sigCtx.beginPath(); sigCtx.moveTo(p.x, p.y);
+});
+sigCanvas.addEventListener('mousemove', e => {
+  e.preventDefault(); if (!state.sigDrawing) return;
+  const p = getSigPos(e);
   sigCtx.strokeStyle = $('sigColor').value;
-  sigCtx.lineWidth = parseFloat($('sigStroke').value);
-  sigCtx.lineCap = 'round';
-  sigCtx.lineJoin = 'round';
-  sigCtx.lineTo(pos.x, pos.y);
-  sigCtx.stroke();
-  state.sigLastX = pos.x;
-  state.sigLastY = pos.y;
-}
+  sigCtx.lineWidth   = +$('sigStroke').value;
+  sigCtx.lineCap = 'round'; sigCtx.lineJoin = 'round';
+  sigCtx.lineTo(p.x, p.y); sigCtx.stroke();
+});
+sigCanvas.addEventListener('mouseup',    () => { state.sigDrawing = false; });
+sigCanvas.addEventListener('mouseleave', () => { state.sigDrawing = false; });
 
-function sigEnd(e) {
-  e.preventDefault();
-  state.sigDrawing = false;
-}
+// Touch
+sigCanvas.addEventListener('touchstart', e => {
+  e.preventDefault(); state.sigDrawing = true;
+  const p = getSigPos(e); sigCtx.beginPath(); sigCtx.moveTo(p.x, p.y);
+}, { passive: false });
+sigCanvas.addEventListener('touchmove', e => {
+  e.preventDefault(); if (!state.sigDrawing) return;
+  const p = getSigPos(e);
+  sigCtx.strokeStyle = $('sigColor').value;
+  sigCtx.lineWidth   = +$('sigStroke').value;
+  sigCtx.lineCap = 'round'; sigCtx.lineJoin = 'round';
+  sigCtx.lineTo(p.x, p.y); sigCtx.stroke();
+}, { passive: false });
+sigCanvas.addEventListener('touchend', () => { state.sigDrawing = false; });
 
-// Mouse events
-sigCanvas.addEventListener('mousedown', sigStart);
-sigCanvas.addEventListener('mousemove', sigMove);
-sigCanvas.addEventListener('mouseup', sigEnd);
-sigCanvas.addEventListener('mouseleave', sigEnd);
+$('sigPickBtn').addEventListener('click', () => {
+  setPlacementMode(state.placementMode === 'signature' ? null : 'signature', 'sigPickBtn');
+});
 
-// Touch events
-sigCanvas.addEventListener('touchstart', sigStart, { passive: false });
-sigCanvas.addEventListener('touchmove', sigMove, { passive: false });
-sigCanvas.addEventListener('touchend', sigEnd);
-
-/** Embed the drawn signature into the PDF */
 $('addSigBtn').addEventListener('click', async () => {
-  if (!state.pdfDoc) return;
-
-  // Check if canvas is empty
-  const imgData = sigCtx.getImageData(0, 0, sigCanvas.width, sigCanvas.height);
-  const isEmpty = !imgData.data.some(ch => ch > 0);
-  if (isEmpty) { showToast('Please draw a signature first.', 'error'); return; }
-
+  if (!state.rawBytes) return;
+  const data = sigCtx.getImageData(0, 0, sigCanvas.width, sigCanvas.height);
+  if (!data.data.some(v => v > 0)) { showToast('Please draw a signature first.', 'error'); return; }
   const pageNum = parseInt($('sigPage').value, 10);
-  if (isNaN(pageNum) || pageNum < 1 || pageNum > state.totalPages) {
-    showToast('Invalid page number.', 'error'); return;
-  }
-
-  const x    = parseFloat($('sigX').value) || 0;
-  const yTop = parseFloat($('sigY').value) || 0;
+  if (!validPage(pageNum)) return;
+  const x    = parseFloat($('sigX').value) || 50;
+  const yTop = parseFloat($('sigY').value) || 50;
   const w    = parseFloat($('sigW').value) || 200;
   const h    = parseFloat($('sigH').value) || 80;
 
   setLoading(true, 'Embedding signature…');
   try {
-    // Export canvas as PNG
-    const pngDataUrl = sigCanvas.toDataURL('image/png');
-    const pngBytes = dataURLtoBytes(pngDataUrl);
-
-    const bytes = await getRebuildBytes();
-    const doc = await PDFLib.PDFDocument.load(bytes);
-    const embeddedImg = await doc.embedPng(pngBytes);
-
-    const pages = doc.getPages();
-    const page = pages[pageNum - 1];
-    const { height } = page.getSize();
-    const yPdf = height - yTop - h;
-
-    page.drawImage(embeddedImg, { x, y: yPdf, width: w, height: h });
-
-    const newBytes = await doc.save();
-    await reloadFromBytes(newBytes);
-    showToast('Signature embedded!', 'success');
+    const pngBytes = dataURLtoBytes(sigCanvas.toDataURL('image/png'));
+    const base = await getRebuildBytes();
+    const doc  = await PDFLib.PDFDocument.load(base, { ignoreEncryption: true });
+    const img  = await doc.embedPng(pngBytes);
+    const page = doc.getPages()[pageNum - 1];
+    page.drawImage(img, { x, y: page.getSize().height - yTop - h, width: w, height: h });
+    await applyNewBytes(await doc.save());
+    setPlacementMode(null);
+    showToast('Signature embedded! Preview updated.', 'success');
   } catch (err) {
     console.error('Signature error:', err);
-    showToast('Failed to embed signature.', 'error');
+    showToast(`Failed to embed signature: ${err.message}`, 'error');
   } finally {
     setLoading(false);
   }
 });
 
 /* =============================================
-   SECURITY MODULE (Password)
+   SECURITY
    ============================================= */
-
-/**
- * pdf-lib supports setting owner/user passwords with 128-bit RC4 encryption.
- * This is browser-native and does not require a backend.
- */
 $('applyPwdBtn').addEventListener('click', async () => {
-  if (!state.pdfDoc) return;
-
+  if (!state.rawBytes) return;
   const userPwd = $('userPassword').value;
-  const ownerPwd = $('ownerPassword').value || userPwd;
-
   if (!userPwd) { showToast('Please enter a user password.', 'error'); return; }
-
-  setLoading(true, 'Encrypting PDF…');
+  setLoading(true, 'Preparing PDF for download…');
   try {
+    // pdf-lib 1.x does not support writing encrypted PDFs — save as-is
     const bytes = await getRebuildBytes();
-    const doc = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
-
-    // pdf-lib does not yet support writing encrypted PDFs natively.
-    // We save the PDF and note the password in metadata as a workaround.
-    // For real encryption, users should use a tool like Ghostscript after downloading.
-    const pdfBytes = await doc.save();
-
-    // Create a simple warning document to explain
-    const warnDoc = await PDFLib.PDFDocument.create();
-    const warnPage = warnDoc.addPage();
-    const font = await warnDoc.embedFont(PDFLib.StandardFonts.Helvetica);
-    warnPage.drawText(
-      'Note: pdf-lib v1.x does not support writing encrypted PDFs in-browser.\n' +
-      'Your PDF has been saved without encryption.\n' +
-      'To add password protection, open it in Adobe Acrobat or use:\n' +
-      '  qpdf --encrypt <userPwd> <ownerPwd> 128 -- input.pdf output.pdf',
-      { x: 40, y: warnPage.getHeight() - 80, size: 12, font, maxWidth: 500, lineHeight: 20 }
-    );
-
-    downloadBytes(pdfBytes, 'protected.pdf');
+    downloadBytes(bytes, 'document.pdf');
     showToast(
-      'PDF downloaded. Note: in-browser encryption is limited. See README for details.',
-      'info',
-      6000
+      'PDF saved without encryption (pdf-lib limitation). ' +
+      'Run: qpdf --encrypt ' + userPwd + ' ' + ($('ownerPassword').value || userPwd) + ' 256 -- doc.pdf out.pdf',
+      'info', 8000
     );
   } catch (err) {
-    console.error('Password error:', err);
-    showToast('Failed to process PDF.', 'error');
+    console.error('Security error:', err);
+    showToast(`Failed: ${err.message}`, 'error');
   } finally {
     setLoading(false);
   }
 });
 
 /* =============================================
-   DOWNLOAD MODULE
+   DOWNLOAD
    ============================================= */
-
-/** Download the current edited PDF */
 $('downloadBtn').addEventListener('click', async () => {
-  if (!state.pdfDoc) return;
-  setLoading(true, 'Preparing download…');
+  if (!state.rawBytes) return;
+  setLoading(true, 'Building final PDF…');
   try {
     const bytes = await getRebuildBytes();
     downloadBytes(bytes, 'edited.pdf');
     showToast('PDF downloaded!', 'success');
   } catch (err) {
     console.error('Download error:', err);
-    showToast('Failed to generate PDF.', 'error');
+    showToast(`Download failed: ${err.message}`, 'error');
   } finally {
     setLoading(false);
   }
 });
 
 /* =============================================
-   CORE HELPERS
+   UTILITIES
    ============================================= */
-
-/**
- * Rebuild the PDF from current state (page order, rotations, overlays).
- * Returns Uint8Array of the rebuilt PDF bytes.
- */
-async function getRebuildBytes() {
-  if (!state.rawBytes) throw new Error('No PDF loaded');
-
-  const srcDoc = await PDFLib.PDFDocument.load(state.rawBytes, { ignoreEncryption: true });
-  const newDoc = await PDFLib.PDFDocument.create();
-
-  // Copy pages in current order
-  const indices = state.pageOrder.map(origIdx => origIdx);
-  const copiedPages = await newDoc.copyPages(srcDoc, indices);
-
-  copiedPages.forEach((page, orderIdx) => {
-    const origIdx = state.pageOrder[orderIdx];
-    const addedRotation = state.pageRotations[origIdx] || 0;
-    if (addedRotation) {
-      const current = page.getRotation().angle;
-      page.setRotation(PDFLib.degrees((current + addedRotation) % 360));
-    }
-    newDoc.addPage(page);
-  });
-
-  return newDoc.save();
-}
-
-/**
- * After an edit operation, reload state from new bytes so
- * future operations (like adding more overlays) work on the updated PDF.
- */
-async function reloadFromBytes(bytes) {
-  state.rawBytes = bytes;
-  state.pdfDoc = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
-  state.pdfJsDoc = await pdfjsLib.getDocument({ data: bytes }).promise;
-  state.totalPages = state.pdfJsDoc.numPages;
-
-  // Preserve page order length but reset if page count changed
-  if (state.pageOrder.length !== state.totalPages) {
-    state.pageOrder = Array.from({ length: state.totalPages }, (_, i) => i);
-    state.pageRotations = {};
-  }
-
-  await renderPreview();
-}
-
-/** Trigger a browser download of bytes as a PDF file */
-function downloadBytes(bytes, filename = 'document.pdf') {
+function downloadBytes(bytes, filename) {
   const blob = new Blob([bytes], { type: 'application/pdf' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
+  const url  = URL.createObjectURL(blob);
+  const a    = Object.assign(document.createElement('a'), { href: url, download: filename });
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
-/** Convert hex color string to {r, g, b} object */
 function hexToRgb(hex) {
-  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  return result
-    ? { r: parseInt(result[1], 16), g: parseInt(result[2], 16), b: parseInt(result[3], 16) }
-    : { r: 0, g: 0, b: 0 };
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return m ? { r: parseInt(m[1],16), g: parseInt(m[2],16), b: parseInt(m[3],16) } : { r:0,g:0,b:0 };
 }
 
-/** Convert a data URL (base64) to Uint8Array */
 function dataURLtoBytes(dataURL) {
-  const base64 = dataURL.split(',')[1];
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
+  const b64 = dataURL.split(',')[1];
+  const bin = atob(b64);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf;
 }
 
 /* =============================================
    INIT
    ============================================= */
-console.log('%c PDF Studio ', 'background:#4f8ef7;color:white;font-size:1.2rem;padding:4px 12px;border-radius:4px;');
-console.log('Client-side PDF editor. All processing is local. No data leaves your browser.');
+enableButtons(false);
+console.log('%c PDF Studio v2 ', 'background:#4f8ef7;color:white;font-size:1.2rem;padding:4px 12px;border-radius:4px;');
+console.log('All processing is 100% local. Nothing leaves your browser.');
