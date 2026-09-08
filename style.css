@@ -785,6 +785,20 @@ select.input { cursor:pointer }
 .ws-panel { display:none }
 .ws-panel.active { display:flex; flex-direction:column; gap:14px }
 
+.ws-tab {
+  display:flex; align-items:center; gap:9px; padding:9px 10px; border:none;
+  background:transparent; color:var(--muted); border-radius:var(--r); cursor:pointer;
+  font-family:var(--body); font-size:.81rem; font-weight:500;
+  transition:all var(--tr); text-align:left; width:100%; position:relative;
+}
+.ws-tab i { width:14px; text-align:center; font-size:.84rem; flex-shrink:0 }
+.ws-tab:hover  { background:var(--surface3); color:var(--text) }
+.ws-tab.active { background:var(--accent-dim); color:var(--accent); font-weight:600 }
+.ws-tab.active::before {
+  content:''; position:absolute; left:-7px; top:50%; transform:translateY(-50%);
+  width:3px; height:60%; border-radius:0 3px 3px 0; background:var(--accent);
+}
+
 .sidebar-divider {
   height:1px; background:var(--border); margin:6px 4px;
 }
