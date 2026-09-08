@@ -2730,6 +2730,7 @@ const WS = {
   pages: [],             // [{ pdfJsDoc, pageNum, rotation, overlays }]
   filename: 'document.pdf',
   curPage: 1,
+  zoom: 1.0,
   history: [],           // snapshot stack — see wsCommit()
   historyIndex: -1,
   MAX_HISTORY: 30,
@@ -2764,12 +2765,24 @@ function wsScheduleAutosave() {
   clearTimeout(WS.autosaveTimer);
   WS.autosaveTimer = setTimeout(wsAutosaveNow, 800);
 }
+// Strip pdfJsDoc (a live pdf.js object graph — not IndexedDB-safe) out of
+// every history entry before storing. The FULL stack goes to IndexedDB now,
+// not just the latest snapshot — this is what makes "resume" restore your
+// complete Undo/Redo depth instead of collapsing it to a single step.
+function wsHistoryForStorage() {
+  return WS.history.map(snap => ({
+    baseBytes: snap.baseBytes,
+    filename:  snap.filename,
+    label:     snap.label,
+    pages:     snap.pages.map(p => ({ pageNum: p.pageNum, rotation: p.rotation, overlays: p.overlays })),
+  }));
+}
 async function wsAutosaveNow() {
   if (!WS.baseBytes) return;
   try {
     await idbPut('current', {
-      baseBytes: WS.baseBytes,
-      pages: WS.pages.map(p => ({ pageNum: p.pageNum, rotation: p.rotation, overlays: p.overlays })),
+      history: wsHistoryForStorage(),
+      historyIndex: WS.historyIndex,
       filename: WS.filename, savedAt: Date.now(),
     });
     const el = $('wsAutosaveStatus');
@@ -2820,11 +2833,14 @@ async function wsOpenFile(file) {
     WS.pages     = Array.from({ length: doc.numPages }, (_, i) => ({ pdfJsDoc: doc, pageNum: i + 1, rotation: 0, overlays: [] }));
     WS.filename  = file.name;
     WS.curPage   = 1;
+    WS.zoom      = 1.0;
     WS.history = []; WS.historyIndex = -1;
     wsCommit('Open document');
     show($('wsWorkspaceMain')); hide($('wsEmptyState'));
     $('wsFilename').textContent = file.name;
     $('wsExportBtn').disabled = false;
+    $('wsZoomIn').disabled = false; $('wsZoomOut').disabled = false;
+    $('wsZoomLabel').textContent = '100%';
     await wsRenderPreview();
     toast(`Opened "${file.name}" — ${doc.numPages} pages`, 'success');
   } catch (e) { console.error(e); toast(`Failed to open: ${e.message}`, 'error'); }
@@ -2837,7 +2853,7 @@ $('wsFileInput').addEventListener('change', e => { if (e.target.files[0]) wsOpen
 async function wsRenderPreview() {
   if (!WS.pages.length) return;
   const desc = WS.pages[WS.curPage - 1];
-  const { canvas } = await renderPageToCanvas(desc, 1.4);
+  const { canvas } = await renderPageToCanvas(desc, 1.4 * WS.zoom);
   const cv = $('wsPreviewCanvas');
   cv.width = canvas.width; cv.height = canvas.height;
   cv.getContext('2d').drawImage(canvas, 0, 0);
@@ -2848,6 +2864,16 @@ async function wsRenderPreview() {
 }
 $('wsPrevPage').addEventListener('click', () => { if (WS.curPage > 1) { WS.curPage--; wsRenderPreview(); } });
 $('wsNextPage').addEventListener('click', () => { if (WS.curPage < WS.pages.length) { WS.curPage++; wsRenderPreview(); } });
+$('wsZoomIn').addEventListener('click', () => {
+  WS.zoom = Math.min(3.0, +(WS.zoom + 0.25).toFixed(2));
+  $('wsZoomLabel').textContent = Math.round(WS.zoom * 100) + '%';
+  wsRenderPreview();
+});
+$('wsZoomOut').addEventListener('click', () => {
+  WS.zoom = Math.max(0.5, +(WS.zoom - 0.25).toFixed(2));
+  $('wsZoomLabel').textContent = Math.round(WS.zoom * 100) + '%';
+  wsRenderPreview();
+});
 
 /* ── Tab switching (Watermark / Page Numbers) ── */
 document.querySelectorAll('.ws-tab').forEach(btn => {
@@ -2947,28 +2973,41 @@ $('wsHomeBtn').addEventListener('click', showHome);
 async function wsCheckResume() {
   try {
     const saved = await idbGet('current');
-    if (!saved?.baseBytes) return;
+    if (!saved?.history?.length) return;
     const when = saved.savedAt ? new Date(saved.savedAt).toLocaleString() : 'earlier';
-    if (!confirm(`Resume your previous session ("${saved.filename}", autosaved ${when})?`)) {
+    if (!confirm(`Resume your previous session ("${saved.filename}", autosaved ${when}, ${saved.history.length} step${saved.history.length===1?'':'s'} of history)?`)) {
       await idbDelete('current');
       return;
     }
-    WS.baseBytes = saved.baseBytes;
+    // Restore the FULL stack, not just the latest state — Undo/Redo should
+    // work all the way back after a resume, same as it did before you closed the tab.
+    WS.filename     = saved.filename;
+    WS.historyIndex = Math.min(saved.historyIndex, saved.history.length - 1);
+
+    // baseBytes is shared by reference across most entries pre-storage, but
+    // structured-clone through IndexedDB may have deduped OR split those
+    // references depending on browser — rebuild WS.history with each
+    // snapshot's own baseBytes exactly as stored, no assumption either way.
+    const snap = saved.history[WS.historyIndex];
+    WS.baseBytes = snap.baseBytes;
     WS.pdfJsDoc  = await pdfjsLib.getDocument({ data: WS.baseBytes.slice() }).promise;
-    WS.pages     = saved.pages.map(p => ({ pdfJsDoc: WS.pdfJsDoc, pageNum: p.pageNum, rotation: p.rotation, overlays: p.overlays }));
-    WS.filename  = saved.filename;
-    WS.curPage   = 1;
-    WS.history = [{ baseBytes: WS.baseBytes, pages: wsClonePages(WS.pages), filename: WS.filename, label: 'Resumed' }];
-    WS.historyIndex = 0;
+
+    WS.history = saved.history.map(s => ({
+      baseBytes: s.baseBytes, filename: s.filename, label: s.label,
+      pages: s.pages.map(p => ({ pageNum: p.pageNum, rotation: p.rotation, overlays: p.overlays.map(o => ({ ...o })) })),
+    }));
+    await wsRestoreSnapshot(WS.history[WS.historyIndex]);
+
     show($('wsWorkspaceMain')); hide($('wsEmptyState'));
     $('wsFilename').textContent = WS.filename;
     $('wsExportBtn').disabled = false;
+    $('wsZoomIn').disabled = false; $('wsZoomOut').disabled = false;
     await wsRenderPreview();
     wsUpdateUndoRedoBtns();
-    toast('Session resumed.', 'success');
+    toast(`Session resumed — ${WS.history.length} step${WS.history.length===1?'':'s'} of history restored.`, 'success');
   } catch (e) { console.error('[resume check]', e); }
 }
 
 /* ── INIT ── */
 showHome();
-console.log('%c PDF Studio v8.1 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
+console.log('%c PDF Studio v8.2 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
