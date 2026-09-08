@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title>PDF Studio v8.1 - All-in-One PDF Editor</title>
+  <title>PDF Studio v8.2 - All-in-One PDF Editor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=DM+Sans:wght@300;400;500;600&display=swap"/>
-  <link rel="stylesheet" href="style.css?v=8.1"/>
+  <link rel="stylesheet" href="style.css?v=8.2"/>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
@@ -175,8 +175,8 @@
     <aside class="sidebar">
       <nav class="tool-nav">
         <span class="nav-section-label">Edit</span>
-        <button class="tool-btn ws-tab active" data-wstab="watermark"><i class="fa-solid fa-stamp"></i><span>Watermark</span></button>
-        <button class="tool-btn ws-tab" data-wstab="pagenumbers"><i class="fa-solid fa-list-ol"></i><span>Numbers</span></button>
+        <button class="ws-tab active" data-wstab="watermark"><i class="fa-solid fa-stamp"></i><span>Watermark</span></button>
+        <button class="ws-tab" data-wstab="pagenumbers"><i class="fa-solid fa-list-ol"></i><span>Numbers</span></button>
       </nav>
     </aside>
 
@@ -251,6 +251,11 @@
           <button id="wsPrevPage" class="icon-btn" disabled><i class="fa-solid fa-chevron-left"></i></button>
           <span id="wsPageIndicator">— / —</span>
           <button id="wsNextPage" class="icon-btn" disabled><i class="fa-solid fa-chevron-right"></i></button>
+        </div>
+        <div class="zoom-controls">
+          <button id="wsZoomOut" class="icon-btn" disabled><i class="fa-solid fa-minus"></i></button>
+          <span id="wsZoomLabel">100%</span>
+          <button id="wsZoomIn"  class="icon-btn" disabled><i class="fa-solid fa-plus"></i></button>
         </div>
       </div>
       <div class="preview-canvas-wrap">
@@ -1026,6 +1031,6 @@
 </main>
 </div><!-- /editorScreen -->
 
-<script src="script.js?v=8.1"></script>
+<script src="script.js?v=8.2"></script>
 </body>
 </html>
