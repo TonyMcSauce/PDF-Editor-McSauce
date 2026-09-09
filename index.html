@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title>PDF Studio v8.2 - All-in-One PDF Editor</title>
+  <title>PDF Studio v9.0 - All-in-One PDF Editor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=DM+Sans:wght@300;400;500;600&display=swap"/>
-  <link rel="stylesheet" href="style.css?v=8.2"/>
+  <link rel="stylesheet" href="style.css?v=9.0"/>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
@@ -22,7 +22,7 @@
       <i class="fa-solid fa-file-pdf"></i>
       <span>PDF Studio</span>
     </button>
-    <span class="tagline">100% Client-Side · No Upload · No Tracking</span>
+    <span class="tagline">Most Tools Run Locally · No Tracking</span>
   </div>
   <div class="header-right">
     <!-- Home button always visible when in editor -->
@@ -64,7 +64,7 @@
   <div class="home-hero">
     <div class="home-hero-icon"><i class="fa-solid fa-file-pdf"></i></div>
     <h1>Every PDF tool you need</h1>
-    <p>100% free · Works in your browser · Your files never leave your device</p>
+    <p>100% free · Most tools run entirely in your browser</p>
   </div>
 
   <div class="tools-grid">
@@ -177,6 +177,7 @@
         <span class="nav-section-label">Edit</span>
         <button class="ws-tab active" data-wstab="watermark"><i class="fa-solid fa-stamp"></i><span>Watermark</span></button>
         <button class="ws-tab" data-wstab="pagenumbers"><i class="fa-solid fa-list-ol"></i><span>Numbers</span></button>
+        <button class="ws-tab" data-wstab="edittext"><i class="fa-solid fa-i-cursor"></i><span>Edit Text</span></button>
       </nav>
     </aside>
 
@@ -241,6 +242,18 @@
           </div>
           <button id="wsApplyPageNumBtn" class="btn-action"><i class="fa-solid fa-list-ol"></i> Apply to All Pages</button>
         </div>
+
+        <div id="wspanel-edittext" class="panel ws-panel">
+          <h2 class="panel-title"><i class="fa-solid fa-i-cursor"></i> Edit Text</h2>
+          <p class="panel-desc">Click a line of text on the preview to edit it. This genuinely removes the old text and draws your replacement — not a box painted over it.</p>
+          <div class="server-notice">
+            <i class="fa-solid fa-server"></i>
+            <span>Runs on your private Render server (PyMuPDF). No reflow — best for short, single-line edits: names, dates, labels. Font is matched to the closest available, not guaranteed identical.</span>
+          </div>
+          <div id="wsTextEditStatus" class="hint"></div>
+          <div id="wsPendingEditsList" class="redact-box-list"></div>
+          <button id="wsApplyTextEditsBtn" class="btn-action" disabled><i class="fa-solid fa-check"></i> Apply Edits &amp; Continue</button>
+        </div>
       </div>
     </section>
 
@@ -258,12 +271,13 @@
           <button id="wsZoomIn"  class="icon-btn" disabled><i class="fa-solid fa-plus"></i></button>
         </div>
       </div>
-      <div class="preview-canvas-wrap">
+      <div class="preview-canvas-wrap" id="wsPreviewWrap">
         <div id="wsPreviewPlaceholder" class="preview-placeholder">
           <i class="fa-solid fa-file-pdf"></i>
           <p>Open a PDF to preview it here</p>
         </div>
         <canvas id="wsPreviewCanvas" class="hidden"></canvas>
+        <div id="wsTextEditLayer"></div>
       </div>
     </section>
   </main>
@@ -792,7 +806,8 @@
           <button id="redactClearBtn" class="btn-secondary btn-danger-soft"><i class="fa-solid fa-trash"></i> Clear All</button>
         </div>
         <button id="redactApplyBtn" class="btn-action"><i class="fa-solid fa-check"></i> Apply Redactions</button>
-        <p class="hint mt" style="color:var(--danger)"><i class="fa-solid fa-triangle-exclamation"></i> Redactions are permanent once applied.</p>
+        <p class="hint mt" style="color:var(--danger)"><i class="fa-solid fa-triangle-exclamation"></i> Redactions are permanent once applied — content is genuinely removed, not just covered.</p>
+        <p class="hint"><i class="fa-solid fa-server"></i> Runs on your private Render server (PyMuPDF), not entirely in-browser.</p>
       </div>
     </div>
 
@@ -1031,6 +1046,6 @@
 </main>
 </div><!-- /editorScreen -->
 
-<script src="script.js?v=8.2"></script>
+<script src="script.js?v=9.0"></script>
 </body>
 </html>
