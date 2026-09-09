@@ -799,6 +799,25 @@ select.input { cursor:pointer }
   width:3px; height:60%; border-radius:0 3px 3px 0; background:var(--accent);
 }
 
+/* ── EDIT TEXT overlay layer ── */
+#wsTextEditLayer {
+  position:absolute; top:20px; left:20px; z-index:150; pointer-events:none;
+}
+#wsTextEditLayer.active { pointer-events:none } /* spans opt in individually */
+.wste-span {
+  position:absolute; pointer-events:all; cursor:text;
+  border:1px solid transparent; border-radius:2px;
+  background:rgba(79,142,247,.08);
+  transition:background .12s ease, border-color .12s ease;
+}
+.wste-span:hover { background:rgba(79,142,247,.22); border-color:var(--accent) }
+.wste-span.edited { background:rgba(79,142,247,.28); border-color:var(--accent); border-style:solid }
+.wste-input {
+  position:absolute; z-index:200; border:1.5px solid var(--accent); border-radius:2px;
+  background:var(--surface); color:var(--text); font-family:var(--body);
+  padding:0 2px; outline:none; box-shadow:0 2px 10px rgba(0,0,0,.25);
+}
+
 .sidebar-divider {
   height:1px; background:var(--border); margin:6px 4px;
 }
