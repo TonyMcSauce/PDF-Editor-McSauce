@@ -1991,33 +1991,68 @@ $('redactClearBtn').addEventListener('click', () => {
   rdUpdateList();
 });
 
+/* SECURITY FIX: this used to just push a {type:'redact'} overlay that got
+   painted over the content on a canvas — the original text was still
+   sitting in the exported PDF underneath it, extractable by anyone who
+   selected it. This now round-trips through the same PyMuPDF engine Edit
+   Text uses (server-side, apply_redactions()), which genuinely strips
+   the content in the box, not just its appearance. See convert.py's
+   redact_apply() for the actual removal logic. */
 $('redactApplyBtn').addEventListener('click', async () => {
   const pages = S.toolPages['redact']; if (!pages?.length) return;
   if (!RD.boxes.length) { toast('Draw at least one box first.', 'error'); return; }
 
-  loading(true, 'Applying redactions…');
-  try {
-    const pgIdx = S.curPage - 1;
-    const pdfPage = await pages[pgIdx].pdfJsDoc.getPage(pages[pgIdx].pageNum);
-    const vp      = pdfPage.getViewport({ scale: 1 });
+  const pgIdx = S.curPage - 1;
+  const sourceBytes = pages[pgIdx].sourceBytes;
+  if (!sourceBytes) { toast('This page has no original file attached — try re-uploading.', 'error'); return; }
 
-    RD.boxes.forEach(b => {
-      pages[pgIdx].overlays.push({
-        type:  'redact',
-        x:     b.xFrac * vp.width,
-        y:     b.yFrac * vp.height,
-        w:     b.wFrac * vp.width,
-        h:     b.hFrac * vp.height,
+  loading(true, 'Redacting… (server may take 15s to wake — this genuinely removes the content, not just paints over it)');
+  try {
+    const pdfPage = await pages[pgIdx].pdfJsDoc.getPage(pages[pgIdx].pageNum);
+    const vp = pdfPage.getViewport({ scale: 1 });
+
+    const redactions = RD.boxes.map(b => {
+      const x0 = b.xFrac * vp.width, y0 = b.yFrac * vp.height;
+      return {
+        page: pages[pgIdx].pageNum - 1, // 0-based, matches PyMuPDF
+        bbox: [x0, y0, x0 + b.wFrac * vp.width, y0 + b.hFrac * vp.height],
         color: b.color,
-      });
+      };
     });
+
+    const formData = new FormData();
+    formData.append('file', new Blob([sourceBytes], { type: 'application/pdf' }), 'document.pdf');
+    formData.append('redactions', JSON.stringify(redactions));
+    const res = await fetch(`${SERVER_URL}/redact/apply`, {
+      method: 'POST', body: formData, mode: 'cors', headers: apiHeaders(), signal: mkTimeout(120000),
+    });
+    const raw = await res.text();
+    const json = JSON.parse(raw.trim());
+    if (!json.ok) throw new Error(json.error || 'Redaction failed on server.');
+
+    const bin = atob(json.data);
+    const newBytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) newBytes[i] = bin.charCodeAt(i);
+
+    // Content is now genuinely gone from the underlying document — replace
+    // every page's source with the redacted bytes rather than layering a
+    // visual-only overlay on top of the old (still-intact) content.
+    const newDoc = await pdfjsLib.getDocument({ data: newBytes.slice() }).promise;
+    S.toolPages['redact'] = Array.from({ length: newDoc.numPages }, (_, i) => ({
+      pdfJsDoc: newDoc, pageNum: i + 1, rotation: 0, overlays: [], sourceBytes: newBytes,
+    }));
 
     RD.boxes.forEach(b => b.el.remove());
     RD.boxes = [];
     rdUpdateList();
     await previewMain(S.curPage);
-    toast('Redactions applied!', 'success');
-  } finally { loading(false); }
+    toast('Redacted — content genuinely removed, not just covered.', 'success');
+  } catch (e) {
+    console.error('[redact]', e);
+    toast(`Redaction failed: ${e.message}`, 'error');
+  } finally {
+    loading(false);
+  }
 });
 
 function enterRedactMode() { rdEnter(); }
@@ -2480,13 +2515,15 @@ async function doDownload() {
   if(!S.pages.length)return;
   loading(true,'Building PDF…');
   try{
-    // Compress intentionally rasterizes. Annotate/Redact also stay on the
-    // rasterizing path for now — their overlay types aren't implemented
-    // in buildPdfVector() yet (see the header comment above it), so
-    // routing them through the vector engine would silently drop the
-    // annotation/redaction marks from the export rather than just being
-    // slower/heavier. Rasterizing here preserves what you actually drew.
-    const useRaster = S.activeTool === 'compress' || S.activeTool === 'annotate' || S.activeTool === 'redact';
+    // Compress intentionally rasterizes. Annotate stays on the rasterizing
+    // path for now — its overlay type isn't implemented in buildPdfVector()
+    // yet, so routing it through the vector engine would silently drop the
+    // annotation marks rather than just being slower/heavier.
+    // Redact no longer needs this: it now bakes true removal into the
+    // source bytes server-side (see redactApplyBtn above) and leaves no
+    // overlay behind, so its pages are safe to export through the vector
+    // engine like everything else.
+    const useRaster = S.activeTool === 'compress' || S.activeTool === 'annotate';
     const bytes = useRaster
       ? await buildPdf(S.pages, S.activeTool === 'compress' ? S.compressQuality : 0.92)
       : await buildPdfVector(S.pages);
@@ -2735,6 +2772,9 @@ const WS = {
   historyIndex: -1,
   MAX_HISTORY: 30,
   autosaveTimer: null,
+  editTextActive: false,
+  textSpansByPage: null,  // { pageIndex: [span,...] } — cache, invalidated when baseBytes changes
+  pendingTextEdits: [],   // [{ page, bbox, oldText, newText, font, size, color }]
 };
 
 function wsClonePages(pages) {
@@ -2861,6 +2901,7 @@ async function wsRenderPreview() {
   $('wsPageIndicator').textContent = `${WS.curPage} / ${WS.pages.length}`;
   $('wsPrevPage').disabled = WS.curPage <= 1;
   $('wsNextPage').disabled = WS.curPage >= WS.pages.length;
+  if (WS.editTextActive) await wsRenderTextSpanOverlay();
 }
 $('wsPrevPage').addEventListener('click', () => { if (WS.curPage > 1) { WS.curPage--; wsRenderPreview(); } });
 $('wsNextPage').addEventListener('click', () => { if (WS.curPage < WS.pages.length) { WS.curPage++; wsRenderPreview(); } });
@@ -2875,12 +2916,14 @@ $('wsZoomOut').addEventListener('click', () => {
   wsRenderPreview();
 });
 
-/* ── Tab switching (Watermark / Page Numbers) ── */
+/* ── Tab switching (Watermark / Page Numbers / Edit Text) ── */
 document.querySelectorAll('.ws-tab').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.ws-tab').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     document.querySelectorAll('.ws-panel').forEach(p => p.classList.toggle('active', p.id === `wspanel-${btn.dataset.wstab}`));
+    if (btn.dataset.wstab === 'edittext') wsActivateEditText();
+    else wsDeactivateEditText();
   });
 });
 
@@ -2948,6 +2991,184 @@ $('wsApplyPageNumBtn').addEventListener('click', async () => {
   } finally { loading(false); }
 });
 
+/* ══════════════════════════════════════════════════════════════
+   EDIT TEXT — real text editing, and the proving ground for the
+   server-round-trip pattern Redact now shares (see below).
+   Click a line → retype → "Apply Edits" sends the whole batch to
+   PyMuPDF, which genuinely removes the old text (real redaction, not a
+   painted box) and draws the replacement. The result becomes the new
+   base document — this is the one Workspace action whose "undo" means
+   restoring a full document snapshot from before the server call,
+   not replaying a client-side operation, which is exactly why Phase 2's
+   history model was designed around snapshots from day one.
+══════════════════════════════════════════════════════════════ */
+
+async function wsActivateEditText() {
+  WS.editTextActive = true;
+  if (!WS.pages.length) return;
+  if (!WS.textSpansByPage) await wsExtractTextSpans();
+  await wsRenderTextSpanOverlay();
+}
+function wsDeactivateEditText() {
+  WS.editTextActive = false;
+  $('wsTextEditLayer').innerHTML = '';
+}
+
+async function wsExtractTextSpans() {
+  $('wsTextEditStatus').textContent = 'Reading text from the document… (server may take 15s to wake)';
+  try {
+    const formData = new FormData();
+    formData.append('file', new Blob([WS.baseBytes], { type: 'application/pdf' }), WS.filename);
+    const res = await fetch(`${SERVER_URL}/edit-text/extract`, {
+      method: 'POST', body: formData, mode: 'cors', headers: apiHeaders(), signal: mkTimeout(60000),
+    });
+    const raw = await res.text();
+    const json = JSON.parse(raw.trim());
+    if (!json.ok) throw new Error(json.error || 'Could not read text from this PDF.');
+
+    WS.textSpansByPage = {};
+    for (const p of json.result.pages) WS.textSpansByPage[p.pageIndex] = p.spans;
+    const total = Object.values(WS.textSpansByPage).reduce((n, s) => n + s.length, 0);
+    $('wsTextEditStatus').textContent = total
+      ? `Found ${total} editable line${total===1?'':'s'} of text across the document.`
+      : 'No extractable text found — this may be a scanned/image-only PDF.';
+  } catch (e) {
+    console.error('[extract-text]', e);
+    $('wsTextEditStatus').textContent = `Couldn't read text: ${e.message}`;
+    WS.textSpansByPage = {};
+  }
+}
+
+function wsFindPendingEdit(pageIdx, bbox) {
+  return WS.pendingTextEdits.find(e => e.page === pageIdx && e.bbox[0] === bbox[0] && e.bbox[1] === bbox[1]);
+}
+
+async function wsRenderTextSpanOverlay() {
+  const layer = $('wsTextEditLayer');
+  layer.innerHTML = '';
+  if (!WS.editTextActive || !WS.textSpansByPage) return;
+  const pageIdx = WS.curPage - 1; // 0-based, matches PyMuPDF's pageIndex
+  const spans = WS.textSpansByPage[pageIdx] || [];
+  const scale = 1.4 * WS.zoom;
+
+  spans.forEach(span => {
+    const [x0, y0, x1, y1] = span.bbox;
+    const el = document.createElement('div');
+    const pending = wsFindPendingEdit(pageIdx, span.bbox);
+    el.className = 'wste-span' + (pending ? ' edited' : '');
+    el.style.left   = (x0 * scale) + 'px';
+    el.style.top    = (y0 * scale) + 'px';
+    el.style.width  = ((x1 - x0) * scale) + 'px';
+    el.style.height = ((y1 - y0) * scale) + 'px';
+    el.title = pending ? `Edited: "${pending.newText}"` : 'Click to edit';
+    el.addEventListener('click', () => wsStartInlineEdit(el, span, pageIdx, scale));
+    layer.appendChild(el);
+  });
+}
+
+function wsStartInlineEdit(spanEl, span, pageIdx, scale) {
+  const pending = wsFindPendingEdit(pageIdx, span.bbox);
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'wste-input';
+  input.value = pending ? pending.newText : span.text;
+  input.style.left   = spanEl.style.left;
+  input.style.top    = spanEl.style.top;
+  input.style.width  = Math.max(60, parseFloat(spanEl.style.width) + 20) + 'px';
+  input.style.height = spanEl.style.height;
+  input.style.fontSize = Math.max(10, (span.size || 12) * scale * 0.9) + 'px';
+
+  const layer = $('wsTextEditLayer');
+  layer.appendChild(input);
+  input.focus(); input.select();
+
+  const commit = () => {
+    const newText = input.value;
+    input.remove();
+    let entry = wsFindPendingEdit(pageIdx, span.bbox);
+    if (newText.trim() === span.text.trim()) {
+      // Reverted back to the original — drop the pending edit if any.
+      if (entry) WS.pendingTextEdits = WS.pendingTextEdits.filter(e => e !== entry);
+    } else {
+      if (!entry) {
+        entry = { page: pageIdx, bbox: span.bbox, oldText: span.text, font: span.font, size: span.size, color: span.color };
+        WS.pendingTextEdits.push(entry);
+      }
+      entry.newText = newText;
+    }
+    wsRenderTextSpanOverlay();
+    wsRenderPendingEditsList();
+  };
+  input.addEventListener('blur', commit);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') input.blur();
+    if (e.key === 'Escape') { input.value = span.text; input.blur(); }
+  });
+}
+
+function wsRenderPendingEditsList() {
+  const list = $('wsPendingEditsList');
+  list.innerHTML = '';
+  WS.pendingTextEdits.forEach((e, i) => {
+    const item = document.createElement('div');
+    item.className = 'rdbox-item';
+    item.innerHTML = `<span>"${e.oldText.slice(0,24)}" → "${e.newText.slice(0,24)}"</span>
+      <button data-i="${i}"><i class="fa-solid fa-xmark"></i></button>`;
+    item.querySelector('button').addEventListener('click', () => {
+      WS.pendingTextEdits.splice(i, 1);
+      wsRenderPendingEditsList();
+      wsRenderTextSpanOverlay();
+    });
+    list.appendChild(item);
+  });
+  $('wsApplyTextEditsBtn').disabled = WS.pendingTextEdits.length === 0;
+}
+
+$('wsApplyTextEditsBtn').addEventListener('click', async () => {
+  if (!WS.pendingTextEdits.length) return;
+  loading(true, 'Editing text on the server… (may take 15s to wake)');
+  try {
+    const formData = new FormData();
+    formData.append('file', new Blob([WS.baseBytes], { type: 'application/pdf' }), WS.filename);
+    formData.append('edits', JSON.stringify(WS.pendingTextEdits));
+    const res = await fetch(`${SERVER_URL}/edit-text/apply`, {
+      method: 'POST', body: formData, mode: 'cors', headers: apiHeaders(), signal: mkTimeout(120000),
+    });
+    const raw = await res.text();
+    const json = JSON.parse(raw.trim());
+    if (!json.ok) throw new Error(json.error || 'Edit failed on server.');
+
+    const bin = atob(json.data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+    // The server just handed back a NEW base document with the edits
+    // genuinely baked in — that becomes the new source of truth. Any
+    // watermark/page-number overlays already applied are carried over
+    // onto the fresh pages (same page count assumed — true for this
+    // operation since it edits content in place, never adds/removes pages).
+    const oldOverlaysByPage = WS.pages.map(p => p.overlays);
+    WS.baseBytes = bytes;
+    WS.pdfJsDoc  = await pdfjsLib.getDocument({ data: WS.baseBytes.slice() }).promise;
+    WS.pages = Array.from({ length: WS.pdfJsDoc.numPages }, (_, i) => ({
+      pdfJsDoc: WS.pdfJsDoc, pageNum: i + 1, rotation: 0, overlays: oldOverlaysByPage[i] || [],
+    }));
+    WS.pendingTextEdits = [];
+    WS.textSpansByPage = null; // stale — re-extract from the new document on demand
+
+    wsCommit('Edit text');
+    wsRenderPendingEditsList();
+    await wsExtractTextSpans();
+    await wsRenderPreview();
+    toast('Text updated!', 'success');
+  } catch (e) {
+    console.error('[edit-text apply]', e);
+    toast(`Edit failed: ${e.message}`, 'error');
+  } finally {
+    loading(false);
+  }
+});
+
 /* ── Export (reuses buildPdfVector — same non-destructive engine as
    every migrated tool; sourceBytes is just WS.baseBytes for every page) ── */
 $('wsExportBtn').addEventListener('click', async () => {
@@ -3010,4 +3231,4 @@ async function wsCheckResume() {
 
 /* ── INIT ── */
 showHome();
-console.log('%c PDF Studio v8.2 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
+console.log('%c PDF Studio v9.0 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
