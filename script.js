@@ -2875,12 +2875,18 @@ async function wsOpenFile(file) {
     WS.curPage   = 1;
     WS.zoom      = 1.0;
     WS.history = []; WS.historyIndex = -1;
+    WS.textSpansByPage = null; // new document — any previous span cache is invalid
+    WS.pendingTextEdits = [];
     wsCommit('Open document');
     show($('wsWorkspaceMain')); hide($('wsEmptyState'));
     $('wsFilename').textContent = file.name;
     $('wsExportBtn').disabled = false;
     $('wsZoomIn').disabled = false; $('wsZoomOut').disabled = false;
     $('wsZoomLabel').textContent = '100%';
+    // If the Edit Text tab was already selected (e.g. clicked before any
+    // PDF was open, which does nothing yet), a fresh upload needs to kick
+    // off extraction itself — nothing else will trigger it retroactively.
+    if (WS.editTextActive) await wsExtractTextSpans();
     await wsRenderPreview();
     toast(`Opened "${file.name}" — ${doc.numPages} pages`, 'success');
   } catch (e) { console.error(e); toast(`Failed to open: ${e.message}`, 'error'); }
@@ -3005,7 +3011,7 @@ $('wsApplyPageNumBtn').addEventListener('click', async () => {
 
 async function wsActivateEditText() {
   WS.editTextActive = true;
-  if (!WS.pages.length) return;
+  if (!WS.pages.length) { $('wsTextEditStatus').textContent = 'Open a PDF first, then come back to this tab.'; return; }
   if (!WS.textSpansByPage) await wsExtractTextSpans();
   await wsRenderTextSpanOverlay();
 }
@@ -3231,4 +3237,4 @@ async function wsCheckResume() {
 
 /* ── INIT ── */
 showHome();
-console.log('%c PDF Studio v9.0 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
+console.log('%c PDF Studio v9.1 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
