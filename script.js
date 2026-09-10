@@ -2839,6 +2839,19 @@ async function wsRestoreSnapshot(snap) {
   }
   WS.pages = snap.pages.map(p => ({ pdfJsDoc: WS.pdfJsDoc, pageNum: p.pageNum, rotation: p.rotation, overlays: p.overlays.map(o => ({ ...o })) }));
   WS.curPage = Math.max(1, Math.min(WS.curPage, WS.pages.length));
+
+  if (baseChanged) {
+    // The underlying document itself changed (this is what an Edit Text
+    // apply/undo/redo looks like) — any cached text spans and queued-but-
+    // not-yet-applied edits point at bboxes/text from the OLD document and
+    // are no longer valid against this one. Without this, clicking a span
+    // after an undo would silently edit the wrong coordinates against text
+    // that may not even be there anymore.
+    WS.textSpansByPage  = null;
+    WS.pendingTextEdits = [];
+    wsRenderPendingEditsList();
+    if (WS.editTextActive) await wsExtractTextSpans();
+  }
 }
 
 async function wsUndo() {
@@ -3237,4 +3250,4 @@ async function wsCheckResume() {
 
 /* ── INIT ── */
 showHome();
-console.log('%c PDF Studio v9.1 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
+console.log('%c PDF Studio v9.2 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
