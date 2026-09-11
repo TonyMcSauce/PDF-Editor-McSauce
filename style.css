@@ -804,6 +804,16 @@ select.input { cursor:pointer }
   position:absolute; top:20px; left:20px; z-index:150; pointer-events:none;
 }
 #wsTextEditLayer.active { pointer-events:none } /* spans opt in individually */
+
+/* ── IMAGE / SIGNATURE placement layers — same fixed offset as the text
+   layer above (the preview wrap's padding is always 20px, so no per-render
+   JS repositioning is needed); each stays pointer-events:none by default
+   so an inactive tab's layer can never intercept a click meant for
+   another tool — the exact bug class the classic editor hit earlier. ── */
+#wsImgPlacementLayer, #wsSigPlacementLayer {
+  position:absolute; top:20px; left:20px; z-index:150; pointer-events:none;
+}
+#wsImgPlacementLayer.active, #wsSigPlacementLayer.active { pointer-events:all }
 .wste-span {
   position:absolute; pointer-events:all; cursor:text;
   border:1px solid transparent; border-radius:2px;

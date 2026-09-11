@@ -2775,6 +2775,7 @@ const WS = {
   editTextActive: false,
   textSpansByPage: null,  // { pageIndex: [span,...] } — cache, invalidated when baseBytes changes
   pendingTextEdits: [],   // [{ page, bbox, oldText, newText, font, size, color }]
+  currentTab: 'watermark',
 };
 
 function wsClonePages(pages) {
@@ -2922,8 +2923,8 @@ async function wsRenderPreview() {
   $('wsNextPage').disabled = WS.curPage >= WS.pages.length;
   if (WS.editTextActive) await wsRenderTextSpanOverlay();
 }
-$('wsPrevPage').addEventListener('click', () => { if (WS.curPage > 1) { WS.curPage--; wsRenderPreview(); } });
-$('wsNextPage').addEventListener('click', () => { if (WS.curPage < WS.pages.length) { WS.curPage++; wsRenderPreview(); } });
+$('wsPrevPage').addEventListener('click', () => { if (WS.curPage > 1) { WS.curPage--; wsClearImagePlacement(); wsClearSigPlacement(); wsRenderPreview(); } });
+$('wsNextPage').addEventListener('click', () => { if (WS.curPage < WS.pages.length) { WS.curPage++; wsClearImagePlacement(); wsClearSigPlacement(); wsRenderPreview(); } });
 $('wsZoomIn').addEventListener('click', () => {
   WS.zoom = Math.min(3.0, +(WS.zoom + 0.25).toFixed(2));
   $('wsZoomLabel').textContent = Math.round(WS.zoom * 100) + '%';
@@ -2935,14 +2936,25 @@ $('wsZoomOut').addEventListener('click', () => {
   wsRenderPreview();
 });
 
-/* ── Tab switching (Watermark / Page Numbers / Edit Text) ── */
+/* ── Tab switching (Watermark / Page Numbers / Edit Text / Image / Sign) ──
+   Single switch point that activates the tab being entered and tears down
+   every OTHER tab's overlay state — same centralized pattern that fixed
+   the classic editor's "leftover box from another tool" bug, applied here
+   from the start instead of discovered later via a bug report. ── */
 document.querySelectorAll('.ws-tab').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.ws-tab').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     document.querySelectorAll('.ws-panel').forEach(p => p.classList.toggle('active', p.id === `wspanel-${btn.dataset.wstab}`));
-    if (btn.dataset.wstab === 'edittext') wsActivateEditText();
-    else wsDeactivateEditText();
+    WS.currentTab = btn.dataset.wstab;
+
+    if (btn.dataset.wstab === 'edittext') wsActivateEditText(); else wsDeactivateEditText();
+
+    $('wsImgPlacementLayer').classList.toggle('active', btn.dataset.wstab === 'image');
+    if (btn.dataset.wstab !== 'image') wsClearImagePlacement();
+
+    $('wsSigPlacementLayer').classList.toggle('active', btn.dataset.wstab === 'signature');
+    if (btn.dataset.wstab !== 'signature') wsClearSigPlacement();
   });
 });
 
@@ -3188,6 +3200,286 @@ $('wsApplyTextEditsBtn').addEventListener('click', async () => {
   }
 });
 
+/* ══════════════════════════════════════════════════════════════
+   WORKSPACE: ADD IMAGE — same drag-and-drop placement pattern as the
+   classic Image tool, adapted to push into WS.pages and go through
+   wsCommit() instead of the old per-tool overlay flow.
+══════════════════════════════════════════════════════════════ */
+const WSIMG = { boxEl: null, imgEl: null, srcUrl: null };
+
+$('wsImgFileInput').addEventListener('change', async () => {
+  const f = $('wsImgFileInput').files[0];
+  if (!f) return;
+  try {
+    WSIMG.imgEl = await loadImgEl(f);
+    if (WSIMG.srcUrl) URL.revokeObjectURL(WSIMG.srcUrl);
+    WSIMG.srcUrl = WSIMG.imgEl.src;
+    $('wsImgDragThumb').src = WSIMG.srcUrl;
+    show($('wsImgThumbWrap'));
+    toast('Image loaded — drag it onto the page.', 'info', 3000);
+  } catch (e) { toast(e.message, 'error'); }
+});
+
+function wsClearImagePlacement() {
+  if (WSIMG.boxEl) { WSIMG.boxEl.remove(); WSIMG.boxEl = null; }
+  const btn = $('wsAddImageBtn'); if (btn) btn.disabled = true;
+}
+
+function wsImgShowBox(clickX, clickY) {
+  if (!WSIMG.imgEl) { toast('Choose an image first.', 'error'); return; }
+  const layer = $('wsImgPlacementLayer');
+  if (WSIMG.boxEl) WSIMG.boxEl.remove();
+
+  const cv  = $('wsPreviewCanvas');
+  const box = document.createElement('div');
+  box.className = 'placement-box';
+  const img = document.createElement('img'); img.src = WSIMG.srcUrl; box.appendChild(img);
+  const resH = document.createElement('div'); resH.className = 'ph-resize'; box.appendChild(resH);
+  const del = document.createElement('button');
+  del.className = 'ph-delete'; del.innerHTML = '×'; del.title = 'Remove';
+  del.addEventListener('mousedown', e => e.stopPropagation());
+  del.addEventListener('click', e => { e.stopPropagation(); box.remove(); WSIMG.boxEl = null; $('wsAddImageBtn').disabled = true; });
+  box.appendChild(del);
+
+  const iw = WSIMG.imgEl.naturalWidth || 300, ih = WSIMG.imgEl.naturalHeight || 200;
+  const maxW = cv.offsetWidth * 0.35, scale = Math.min(1, maxW / iw);
+  const defW = Math.round(iw * scale), defH = Math.round(ih * scale);
+  const lw = cv.offsetWidth, lh = cv.offsetHeight;
+  const left = clickX !== undefined ? Math.max(0, Math.min(lw - defW, clickX - defW / 2)) : Math.round((lw - defW) / 2);
+  const top  = clickY !== undefined ? Math.max(0, Math.min(lh - defH, clickY - defH / 2)) : Math.round((lh - defH) / 2);
+  box.style.left = left + 'px'; box.style.top = top + 'px'; box.style.width = defW + 'px'; box.style.height = defH + 'px';
+
+  let dragMode = null, startX, startY, startL, startT, startW, startH;
+  box.addEventListener('mousedown', e => {
+    if (e.target === resH) dragMode = 'resize';
+    else if (e.target === del) return;
+    else dragMode = 'move';
+    startX = e.clientX; startY = e.clientY;
+    startL = parseInt(box.style.left); startT = parseInt(box.style.top);
+    startW = box.offsetWidth; startH = box.offsetHeight;
+    e.preventDefault(); e.stopPropagation();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragMode) return;
+    const dx = e.clientX - startX, dy = e.clientY - startY;
+    if (dragMode === 'move') { box.style.left = Math.max(0, startL + dx) + 'px'; box.style.top = Math.max(0, startT + dy) + 'px'; }
+    else { box.style.width = Math.max(24, startW + dx) + 'px'; box.style.height = Math.max(24, startH + dy) + 'px'; }
+  });
+  document.addEventListener('mouseup', () => { dragMode = null; });
+
+  layer.appendChild(box);
+  WSIMG.boxEl = box;
+  $('wsAddImageBtn').disabled = false;
+}
+
+$('wsImgPlacementLayer').addEventListener('click', e => {
+  if (e.target !== $('wsImgPlacementLayer')) return;
+  if (!WSIMG.imgEl) return;
+  const rect = $('wsImgPlacementLayer').getBoundingClientRect();
+  wsImgShowBox(e.clientX - rect.left, e.clientY - rect.top);
+});
+$('wsImgDragThumb').addEventListener('dragstart', e => {
+  e.dataTransfer.effectAllowed = 'copy';
+  e.dataTransfer.setData('text/plain', 'ws-image');
+});
+
+$('wsAddImageBtn').addEventListener('click', async () => {
+  if (!WS.pages.length || !WSIMG.boxEl || !WSIMG.imgEl) { toast('Drag your image onto the page first.', 'error'); return; }
+  const cv = $('wsPreviewCanvas');
+  const bx = parseFloat(WSIMG.boxEl.style.left) || 0, by = parseFloat(WSIMG.boxEl.style.top) || 0;
+  const bw = WSIMG.boxEl.offsetWidth, bh = WSIMG.boxEl.offsetHeight;
+  const p = WS.pages[WS.curPage - 1];
+  const pdfPage = await p.pdfJsDoc.getPage(p.pageNum);
+  const vp = pdfPage.getViewport({ scale: 1 });
+  const scaleX = cv.offsetWidth, scaleY = cv.offsetHeight;
+  p.overlays.push({
+    type: 'image', imgEl: WSIMG.imgEl,
+    x: (bx / scaleX) * vp.width, y: (by / scaleY) * vp.height,
+    w: (bw / scaleX) * vp.width, h: (bh / scaleY) * vp.height,
+  });
+  wsCommit('Add image');
+  wsClearImagePlacement();
+  await wsRenderPreview();
+  toast('Image embedded!', 'success');
+});
+
+/* ══════════════════════════════════════════════════════════════
+   WORKSPACE: SIGN PDF — draw or upload, drag-and-drop placement,
+   same pattern as the classic Signature tool, adapted for WS.pages.
+══════════════════════════════════════════════════════════════ */
+const WSSIG = { boxEl: null, mode: 'draw', uploadImg: null };
+const wsSigCv  = $('wsSigCanvas');
+const wsSigCtx = wsSigCv.getContext('2d');
+let wsSigDrawing = false;
+
+document.querySelectorAll('.tab-btn[data-wssigtab]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn[data-wssigtab]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    WSSIG.mode = btn.dataset.wssigtab;
+    $('wsSigDrawTab').classList.toggle('hidden', WSSIG.mode !== 'draw');
+    $('wsSigUploadTab').classList.toggle('hidden', WSSIG.mode !== 'upload');
+    wsSigRefreshThumb();
+  });
+});
+
+$('wsClearSig').addEventListener('click', () => {
+  wsSigCtx.clearRect(0, 0, wsSigCv.width, wsSigCv.height);
+  hide($('wsSigDragWrap'));
+  $('wsAddSigBtn').disabled = !WSSIG.boxEl;
+});
+function wsSigPos(e) {
+  const r = wsSigCv.getBoundingClientRect(), s = e.touches ? e.touches[0] : e;
+  return { x: (s.clientX - r.left) * (wsSigCv.width / r.width), y: (s.clientY - r.top) * (wsSigCv.height / r.height) };
+}
+function wsSigDraw(e) {
+  e.preventDefault(); if (!wsSigDrawing) return;
+  const p = wsSigPos(e);
+  wsSigCtx.strokeStyle = $('wsSigColor').value;
+  wsSigCtx.lineWidth   = +$('wsSigStroke').value;
+  wsSigCtx.lineCap = 'round'; wsSigCtx.lineJoin = 'round';
+  wsSigCtx.lineTo(p.x, p.y); wsSigCtx.stroke();
+}
+wsSigCv.addEventListener('mousedown', e => { e.preventDefault(); wsSigDrawing = true; const p = wsSigPos(e); wsSigCtx.beginPath(); wsSigCtx.moveTo(p.x, p.y); });
+wsSigCv.addEventListener('mousemove', e => wsSigDraw(e));
+wsSigCv.addEventListener('mouseup',   () => { wsSigDrawing = false; wsSigRefreshThumb(); });
+wsSigCv.addEventListener('mouseleave',() => { wsSigDrawing = false; });
+wsSigCv.addEventListener('touchstart', e => { e.preventDefault(); wsSigDrawing = true; const p = wsSigPos(e); wsSigCtx.beginPath(); wsSigCtx.moveTo(p.x, p.y); }, { passive: false });
+wsSigCv.addEventListener('touchmove',  e => wsSigDraw(e), { passive: false });
+wsSigCv.addEventListener('touchend',   () => { wsSigDrawing = false; wsSigRefreshThumb(); });
+
+$('wsSigImageInput').addEventListener('change', async () => {
+  const f = $('wsSigImageInput').files[0];
+  if (!f) return;
+  try { WSSIG.uploadImg = await loadImgEl(f); wsSigRefreshThumb(); } catch (e) { toast(e.message, 'error'); }
+});
+
+function wsSigCurrentSrc() {
+  return WSSIG.mode === 'draw' ? wsSigCv.toDataURL('image/png') : (WSSIG.uploadImg ? WSSIG.uploadImg.src : null);
+}
+function wsSigRefreshThumb() {
+  const wrap = $('wsSigDragWrap'), thumb = $('wsSigDragThumb');
+  if (WSSIG.mode === 'draw') {
+    const px = wsSigCtx.getImageData(0, 0, wsSigCv.width, wsSigCv.height);
+    if (!px.data.some(v => v > 0)) { hide(wrap); return; }
+    thumb.src = wsSigCv.toDataURL('image/png'); show(wrap);
+  } else {
+    if (!WSSIG.uploadImg) { hide(wrap); return; }
+    thumb.src = WSSIG.uploadImg.src; show(wrap);
+  }
+}
+function wsClearSigPlacement() {
+  if (WSSIG.boxEl) { WSSIG.boxEl.remove(); WSSIG.boxEl = null; }
+  const btn = $('wsAddSigBtn'); if (btn) btn.disabled = true;
+}
+
+function wsSigShowBox(clickX, clickY) {
+  const src = wsSigCurrentSrc();
+  if (!src) { toast('Draw or upload a signature first.', 'error'); return; }
+  const layer = $('wsSigPlacementLayer');
+  if (WSSIG.boxEl) WSSIG.boxEl.remove();
+
+  const cv  = $('wsPreviewCanvas');
+  const box = document.createElement('div');
+  box.className = 'placement-box';
+  const img = document.createElement('img'); img.src = src; box.appendChild(img);
+  const resH = document.createElement('div'); resH.className = 'ph-resize'; box.appendChild(resH);
+  const del = document.createElement('button');
+  del.className = 'ph-delete'; del.innerHTML = '×'; del.title = 'Remove';
+  del.addEventListener('mousedown', e => e.stopPropagation());
+  del.addEventListener('click', e => { e.stopPropagation(); box.remove(); WSSIG.boxEl = null; $('wsAddSigBtn').disabled = true; });
+  box.appendChild(del);
+
+  const defW = Math.round(cv.offsetWidth * 0.30), defH = Math.round(cv.offsetHeight * 0.10);
+  const lw = cv.offsetWidth, lh = cv.offsetHeight;
+  const left = clickX !== undefined ? Math.max(0, Math.min(lw - defW, clickX - defW / 2)) : Math.round((lw - defW) / 2);
+  const top  = clickY !== undefined ? Math.max(0, Math.min(lh - defH, clickY - defH / 2)) : Math.round((lh - defH) / 2);
+  box.style.left = left + 'px'; box.style.top = top + 'px'; box.style.width = defW + 'px'; box.style.height = defH + 'px';
+
+  let dragMode = null, startX, startY, startL, startT, startW, startH;
+  box.addEventListener('mousedown', e => {
+    if (e.target === resH) dragMode = 'resize';
+    else if (e.target === del) return;
+    else dragMode = 'move';
+    startX = e.clientX; startY = e.clientY;
+    startL = parseInt(box.style.left); startT = parseInt(box.style.top);
+    startW = box.offsetWidth; startH = box.offsetHeight;
+    e.preventDefault(); e.stopPropagation();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragMode) return;
+    const dx = e.clientX - startX, dy = e.clientY - startY;
+    if (dragMode === 'move') { box.style.left = Math.max(0, startL + dx) + 'px'; box.style.top = Math.max(0, startT + dy) + 'px'; }
+    else { box.style.width = Math.max(30, startW + dx) + 'px'; box.style.height = Math.max(20, startH + dy) + 'px'; }
+  });
+  document.addEventListener('mouseup', () => { dragMode = null; });
+
+  layer.appendChild(box);
+  WSSIG.boxEl = box;
+  $('wsAddSigBtn').disabled = false;
+}
+
+$('wsSigPlacementLayer').addEventListener('click', e => {
+  if (e.target !== $('wsSigPlacementLayer')) return;
+  if (!wsSigCurrentSrc()) { toast('Draw or upload your signature first, then click to place it.', 'info'); return; }
+  const rect = $('wsSigPlacementLayer').getBoundingClientRect();
+  wsSigShowBox(e.clientX - rect.left, e.clientY - rect.top);
+});
+$('wsSigDragThumb').addEventListener('dragstart', e => {
+  e.dataTransfer.effectAllowed = 'copy';
+  e.dataTransfer.setData('text/plain', 'ws-signature');
+});
+
+$('wsAddSigBtn').addEventListener('click', async () => {
+  if (!WS.pages.length || !WSSIG.boxEl) { toast('Drag your signature onto the page first.', 'error'); return; }
+  const src = wsSigCurrentSrc();
+  if (!src) { toast('Draw or upload a signature first.', 'error'); return; }
+  const cv = $('wsPreviewCanvas');
+  const bx = parseFloat(WSSIG.boxEl.style.left) || 0, by = parseFloat(WSSIG.boxEl.style.top) || 0;
+  const bw = WSSIG.boxEl.offsetWidth, bh = WSSIG.boxEl.offsetHeight;
+  const p = WS.pages[WS.curPage - 1];
+  const pdfPage = await p.pdfJsDoc.getPage(p.pageNum);
+  const vp = pdfPage.getViewport({ scale: 1 });
+  const scaleX = cv.offsetWidth, scaleY = cv.offsetHeight;
+  const img = new Image(); img.src = src;
+  await new Promise(r => { img.onload = r; });
+  p.overlays.push({
+    type: 'signature', imgEl: img,
+    x: (bx / scaleX) * vp.width, y: (by / scaleY) * vp.height,
+    w: (bw / scaleX) * vp.width, h: (bh / scaleY) * vp.height,
+  });
+  wsCommit('Add signature');
+  wsClearSigPlacement();
+  await wsRenderPreview();
+  toast('Signature embedded!', 'success');
+});
+
+/* ── Shared drag-and-drop target on the preview wrap for both Image and
+   Signature — routed by WS.currentTab so a drop always lands on whichever
+   tool is actually showing. ── */
+$('wsPreviewWrap').addEventListener('dragover', e => {
+  const wantsImg = WS.currentTab === 'image' && WSIMG.imgEl;
+  const wantsSig = WS.currentTab === 'signature' && wsSigCurrentSrc();
+  if (!wantsImg && !wantsSig) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+  $('wsPreviewWrap').classList.add('dragover-target');
+});
+$('wsPreviewWrap').addEventListener('dragleave', () => {
+  $('wsPreviewWrap').classList.remove('dragover-target');
+});
+$('wsPreviewWrap').addEventListener('drop', e => {
+  const wantsImg = WS.currentTab === 'image' && WSIMG.imgEl;
+  const wantsSig = WS.currentTab === 'signature' && wsSigCurrentSrc();
+  if (!wantsImg && !wantsSig) return;
+  e.preventDefault();
+  $('wsPreviewWrap').classList.remove('dragover-target');
+  const cv = $('wsPreviewCanvas');
+  const rect = cv.getBoundingClientRect();
+  if (wantsImg) wsImgShowBox(e.clientX - rect.left, e.clientY - rect.top);
+  else wsSigShowBox(e.clientX - rect.left, e.clientY - rect.top);
+});
+
 /* ── Export (reuses buildPdfVector — same non-destructive engine as
    every migrated tool; sourceBytes is just WS.baseBytes for every page) ── */
 $('wsExportBtn').addEventListener('click', async () => {
@@ -3250,4 +3542,4 @@ async function wsCheckResume() {
 
 /* ── INIT ── */
 showHome();
-console.log('%c PDF Studio v9.2 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
+console.log('%c PDF Studio v9.3 ','background:#4f8ef7;color:#fff;font-size:1rem;padding:3px 12px;border-radius:4px');
